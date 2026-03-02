@@ -60,8 +60,8 @@ type RelationshipPath = {
   relationship: DiagramRelationship;
   points: Point[];
   diamond: Point;
-  fromCardinality: "o<" | "o|" | "||";
-  toCardinality: "o|" | "||";
+  fromCardinality: Cardinality;
+  toCardinality: Cardinality;
   fromTotalParticipation: boolean;
   toTotalParticipation: boolean;
   label: string;
@@ -75,6 +75,7 @@ type DiagramLayout = {
 };
 
 type ExportFormat = "png" | "jpg";
+type Cardinality = "1" | "N" | "M" | "0..1" | "0..N";
 
 type ViewTransform = {
   scale: number;
@@ -109,6 +110,76 @@ CREATE TABLE order_items (
   unit_price DECIMAL(10,2) NOT NULL,
   CONSTRAINT fk_order_items_order FOREIGN KEY (order_id) REFERENCES orders(id)
 );`;
+
+const BANK_SAMPLE_SQL = `CREATE TABLE bank (
+  code VARCHAR(20) PRIMARY KEY,
+  bname VARCHAR(120) NOT NULL
+);
+
+CREATE TABLE branch (
+  branch_code VARCHAR(20) PRIMARY KEY,
+  bank_code VARCHAR(20) NOT NULL REFERENCES bank(code),
+  blocation VARCHAR(120) NOT NULL,
+  bname VARCHAR(120) NOT NULL
+);
+
+CREATE TABLE employee (
+  eid INT PRIMARY KEY,
+  branch_code VARCHAR(20) NOT NULL REFERENCES branch(branch_code),
+  designation VARCHAR(80) NOT NULL,
+  salary DECIMAL(12,2) NOT NULL
+);
+
+CREATE TABLE customer (
+  cid INT PRIMARY KEY,
+  branch_code VARCHAR(20) NOT NULL REFERENCES branch(branch_code),
+  cname VARCHAR(120) NOT NULL,
+  address VARCHAR(255) NOT NULL,
+  dob DATE NOT NULL
+);
+
+CREATE TABLE account (
+  acc_no VARCHAR(20) PRIMARY KEY,
+  branch_code VARCHAR(20) NOT NULL REFERENCES branch(branch_code),
+  customer_id INT NOT NULL REFERENCES customer(cid),
+  type VARCHAR(20) NOT NULL
+);
+
+CREATE TABLE loan (
+  loan_no VARCHAR(20) PRIMARY KEY,
+  branch_code VARCHAR(20) NOT NULL REFERENCES branch(branch_code),
+  customer_id INT NOT NULL REFERENCES customer(cid),
+  amount DECIMAL(12,2) NOT NULL,
+  rate DECIMAL(5,2) NOT NULL
+);`;
+
+const RELATIONSHIP_LABEL_MAP: Record<string, string> = {
+  "branch->bank": "has",
+  "employee->branch": "works in",
+  "customer->branch": "contains",
+  "account->branch": "maintains",
+  "loan->branch": "provides",
+  "account->customer": "has",
+  "loan->customer": "avails",
+  "orders->users": "books",
+  "order_items->orders": "contains",
+};
+
+function getRelationshipLabel(relation: DiagramRelationship): string {
+  const from = getShortName(relation.fromTable).toLowerCase();
+  const to = getShortName(relation.toTable).toLowerCase();
+  const direct = RELATIONSHIP_LABEL_MAP[`${from}->${to}`];
+  if (direct) {
+    return direct;
+  }
+
+  const reverse = RELATIONSHIP_LABEL_MAP[`${to}->${from}`];
+  if (reverse) {
+    return reverse;
+  }
+
+  return "relates";
+}
 
 function stripIdentifierQuotes(value: string): string {
   const trimmed = value.trim();
@@ -555,6 +626,36 @@ function getRectangleBorderCenterPoint(
   };
 }
 
+function hashTextToSeed(value: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0) || 1;
+}
+
+function createSeededRandom(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+}
+
+function shuffleArray<T>(input: T[], random: () => number): T[] {
+  const output = [...input];
+  for (let index = output.length - 1; index > 0; index -= 1) {
+    const randomIndex = Math.floor(random() * (index + 1));
+    const current = output[index];
+    output[index] = output[randomIndex];
+    output[randomIndex] = current;
+  }
+
+  return output;
+}
+
 function buildDiagramLayout(model: DiagramModel): DiagramLayout {
   if (model.entities.length === 0) {
     return { width: 1600, height: 900, entities: [], relationshipPaths: [] };
@@ -571,9 +672,9 @@ function buildDiagramLayout(model: DiagramModel): DiagramLayout {
   const attributeToEntityGap = 124;
   const sideSpace = maxOvalRadius + attributeToEntityGap + 22;
 
-  const cellWidth = Math.max(980, entityWidth + sideSpace * 2);
+  const cellWidth = Math.max(920, entityWidth + sideSpace * 2);
   const cellHeight = Math.max(620, maxSideAttributes * 86 + 280);
-  const padding = 150;
+  const padding = 190;
 
   const cols = Math.max(1, Math.ceil(Math.sqrt(model.entities.length)));
   const rows = Math.ceil(model.entities.length / cols);
@@ -581,12 +682,39 @@ function buildDiagramLayout(model: DiagramModel): DiagramLayout {
   const width = padding * 2 + cols * cellWidth;
   const height = padding * 2 + rows * cellHeight;
 
+  const seedSource = [
+    ...model.entities.map((entity) => entity.name.toLowerCase()).sort(),
+    ...model.relationships
+      .map(
+        (relation) =>
+          `${relation.fromTable.toLowerCase()}.${relation.fromColumn.toLowerCase()}->${relation.toTable.toLowerCase()}.${relation.toColumn.toLowerCase()}`,
+      )
+      .sort(),
+  ].join("|");
+  const random = createSeededRandom(hashTextToSeed(seedSource));
+
+  const slots: Point[] = [];
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      slots.push({
+        x: padding + col * cellWidth + cellWidth / 2,
+        y: padding + row * cellHeight + cellHeight / 2,
+      });
+    }
+  }
+  const shuffledSlots = shuffleArray(slots, random);
+  const maxJitterX = Math.min(132, cellWidth * 0.17);
+  const maxJitterY = Math.min(102, cellHeight * 0.16);
+
   const positionedEntities: PositionedEntity[] = model.entities.map(
     (entity, index) => {
-      const col = index % cols;
-      const row = Math.floor(index / cols);
-      const centerX = padding + col * cellWidth + cellWidth / 2;
-      const centerY = padding + row * cellHeight + cellHeight / 2;
+      const slot = shuffledSlots[index] ??
+        slots[index % slots.length] ?? {
+          x: padding + cellWidth / 2,
+          y: padding + cellHeight / 2,
+        };
+      const centerX = slot.x + (random() - 0.5) * maxJitterX * 2;
+      const centerY = slot.y + (random() - 0.5) * maxJitterY * 2;
       const x = centerX - entityWidth / 2;
       const y = centerY - entityHeight / 2;
 
@@ -648,7 +776,7 @@ function buildDiagramLayout(model: DiagramModel): DiagramLayout {
   }
 
   const relationshipPaths: RelationshipPath[] = model.relationships
-    .map((relation, relationIndex) => {
+    .map((relation, relationIndex): RelationshipPath | null => {
       const fromEntity = entityLookup.get(relation.fromTable.toLowerCase());
       const toEntity = entityLookup.get(relation.toTable.toLowerCase());
 
@@ -697,11 +825,15 @@ function buildDiagramLayout(model: DiagramModel): DiagramLayout {
         (attribute) =>
           attribute.attribute.name.toLowerCase() === relation.fromColumn.toLowerCase(),
       )?.attribute;
-      const fromCardinality: RelationshipPath["fromCardinality"] =
-        fkAttribute?.isUnique || fkAttribute?.isPrimary ? "o|" : "o<";
-      const toCardinality: RelationshipPath["toCardinality"] = fkAttribute?.isNullable
-        ? "o|"
-        : "||";
+      const isOneOnFromSide = Boolean(fkAttribute?.isUnique || fkAttribute?.isPrimary);
+      const fromCardinality: RelationshipPath["fromCardinality"] = fkAttribute?.isNullable
+        ? isOneOnFromSide
+          ? "0..1"
+          : "0..N"
+        : isOneOnFromSide
+          ? "1"
+          : "N";
+      const toCardinality: RelationshipPath["toCardinality"] = "1";
       const fromTotalParticipation = fkAttribute ? !fkAttribute.isNullable : false;
       const toTotalParticipation = false;
 
@@ -713,7 +845,7 @@ function buildDiagramLayout(model: DiagramModel): DiagramLayout {
         toCardinality,
         fromTotalParticipation,
         toTotalParticipation,
-        label: `${relation.fromColumn} refs ${getShortName(relation.toTable)}`,
+        label: getRelationshipLabel(relation),
       };
     })
     .filter((path): path is RelationshipPath => path !== null);
@@ -794,6 +926,10 @@ function fitText(
   return `${output}...`;
 }
 
+function toRelationToken(cardinality: Cardinality): "1" | "N" {
+  return cardinality === "1" || cardinality === "0..1" ? "1" : "N";
+}
+
 function drawCanvasDiagram(
   context: CanvasRenderingContext2D,
   layout: DiagramLayout,
@@ -804,14 +940,14 @@ function drawCanvasDiagram(
   context.clearRect(0, 0, viewportWidth, viewportHeight);
 
   const background = context.createLinearGradient(0, 0, viewportWidth, viewportHeight);
-  background.addColorStop(0, "#0b1018");
-  background.addColorStop(0.56, "#111a2a");
-  background.addColorStop(1, "#09111a");
+  background.addColorStop(0, "#f5f5f5");
+  background.addColorStop(0.56, "#ededed");
+  background.addColorStop(1, "#e6e6e6");
   context.fillStyle = background;
   context.fillRect(0, 0, viewportWidth, viewportHeight);
 
   context.save();
-  context.strokeStyle = "rgba(141, 172, 214, 0.11)";
+  context.strokeStyle = "rgba(0, 0, 0, 0.06)";
   context.lineWidth = 1;
   context.beginPath();
   const gridStep = 34;
@@ -827,7 +963,7 @@ function drawCanvasDiagram(
   context.restore();
 
   if (layout.entities.length === 0) {
-    context.fillStyle = "rgba(223, 236, 255, 0.9)";
+    context.fillStyle = "rgba(18, 18, 18, 0.8)";
     context.font = "600 19px Iowan Old Style, Palatino Linotype, Palatino, Garamond, serif";
     context.textAlign = "center";
     context.textBaseline = "middle";
@@ -844,12 +980,12 @@ function drawCanvasDiagram(
   context.scale(view.scale, view.scale);
 
   drawRoundedRect(context, -8, -8, layout.width + 16, layout.height + 16, 12);
-  context.strokeStyle = "rgba(179, 213, 252, 0.18)";
+  context.strokeStyle = "rgba(0, 0, 0, 0.16)";
   context.lineWidth = 1.2;
   context.stroke();
 
-  context.strokeStyle = "#7bc3ff";
-  context.lineWidth = 2.4;
+  context.strokeStyle = "#161616";
+  context.lineWidth = 2;
   context.lineCap = "round";
   context.lineJoin = "round";
 
@@ -903,39 +1039,53 @@ function drawCanvasDiagram(
     const startDx = next.x - start.x;
     const startDy = next.y - start.y;
     const startLength = Math.max(1, Math.hypot(startDx, startDy));
-    const startLabelX = start.x + (startDx / startLength) * 18 + (-startDy / startLength) * 10;
-    const startLabelY = start.y + (startDy / startLength) * 18 + (startDx / startLength) * 10;
+    const startLabelX = start.x + (startDx / startLength) * 28 + (-startDy / startLength) * 11;
+    const startLabelY = start.y + (startDy / startLength) * 28 + (startDx / startLength) * 11;
 
     const end = route.points[route.points.length - 1];
     const previous = route.points[route.points.length - 2];
     const endDx = previous.x - end.x;
     const endDy = previous.y - end.y;
     const endLength = Math.max(1, Math.hypot(endDx, endDy));
-    const endLabelX = end.x + (endDx / endLength) * 18 + (-endDy / endLength) * 10;
-    const endLabelY = end.y + (endDy / endLength) * 18 + (endDx / endLength) * 10;
+    const endLabelX = end.x + (endDx / endLength) * 28 + (-endDy / endLength) * 11;
+    const endLabelY = end.y + (endDy / endLength) * 28 + (endDx / endLength) * 11;
 
-    context.font = "700 12px Menlo, Monaco, Consolas, 'Courier New', monospace";
-    context.fillStyle = "#d7e9ff";
-    context.fillText(route.fromCardinality, startLabelX, startLabelY);
-    context.fillText(route.toCardinality, endLabelX, endLabelY);
+    const fromToken = toRelationToken(route.fromCardinality);
+    const toToken = toRelationToken(route.toCardinality);
+    const relationRatio = `${toToken}-${fromToken}`;
 
-    const diamondSize = 14;
-    context.save();
-    context.translate(route.diamond.x, route.diamond.y);
-    context.rotate(Math.PI / 4);
+    context.font = "700 14px Menlo, Monaco, Consolas, 'Courier New', monospace";
+    context.fillStyle = "#6caea0";
+    context.fillText(fromToken, startLabelX, startLabelY);
+    context.fillText(toToken, endLabelX, endLabelY);
+
+    context.font = "600 16px Iowan Old Style, Palatino Linotype, Palatino, Garamond, serif";
+    const relationLabel = fitText(context, route.label, 128);
+    const relationTextWidth = context.measureText(relationLabel).width;
+    const diamondWidth = Math.max(96, relationTextWidth + 44);
+    const diamondHeight = 54;
+    const cx = route.diamond.x;
+    const cy = route.diamond.y;
+
     context.beginPath();
-    context.rect(-diamondSize / 2, -diamondSize / 2, diamondSize, diamondSize);
-    context.fillStyle = "#0f1a2a";
+    context.moveTo(cx, cy - diamondHeight / 2);
+    context.lineTo(cx + diamondWidth / 2, cy);
+    context.lineTo(cx, cy + diamondHeight / 2);
+    context.lineTo(cx - diamondWidth / 2, cy);
+    context.closePath();
+    context.fillStyle = "#f7f7f7";
     context.fill();
-    context.strokeStyle = "#7bc3ff";
-    context.lineWidth = 2;
+    context.strokeStyle = "#111111";
+    context.lineWidth = 1.9;
     context.stroke();
-    context.restore();
 
-    context.font = "600 10px Menlo, Monaco, Consolas, 'Courier New', monospace";
-    const visibleLabel = fitText(context, route.label, 74);
-    context.fillStyle = "#dcecff";
-    context.fillText(visibleLabel, route.diamond.x, route.diamond.y + 20);
+    context.font = "600 14px Iowan Old Style, Palatino Linotype, Palatino, Garamond, serif";
+    context.fillStyle = "#111111";
+    context.fillText(relationLabel, cx, cy + 1);
+
+    context.font = "700 13px Menlo, Monaco, Consolas, 'Courier New', monospace";
+    context.fillStyle = "#111111";
+    context.fillText(relationRatio, cx, cy + diamondHeight / 2 + 16);
   }
 
   for (const positionedEntity of layout.entities) {
@@ -950,19 +1100,19 @@ function drawCanvasDiagram(
       context.beginPath();
       context.moveTo(lineStartX, lineStartY);
       context.lineTo(lineEndX, attribute.y);
-      context.strokeStyle = "#8ea9cf";
-      context.lineWidth = 1.7;
+      context.strokeStyle = "#111111";
+      context.lineWidth = 1.5;
       context.stroke();
 
       context.beginPath();
       context.ellipse(attribute.x, attribute.y, attribute.rx, attribute.ry, 0, 0, Math.PI * 2);
-      context.fillStyle = "#0e1725";
+      context.fillStyle = "#fdfdfd";
       context.fill();
       if (attribute.attribute.isDerived) {
         context.setLineDash([6, 4]);
       }
-      context.strokeStyle = "#a2bddf";
-      context.lineWidth = 1.8;
+      context.strokeStyle = "#111111";
+      context.lineWidth = 1.5;
       context.stroke();
       context.setLineDash([]);
 
@@ -977,13 +1127,13 @@ function drawCanvasDiagram(
           0,
           Math.PI * 2,
         );
-        context.strokeStyle = "#a2bddf";
-        context.lineWidth = 1.2;
+        context.strokeStyle = "#111111";
+        context.lineWidth = 1.1;
         context.stroke();
       }
 
       context.font = "500 11px Menlo, Monaco, Consolas, 'Courier New', monospace";
-      context.fillStyle = "#deebff";
+      context.fillStyle = "#111111";
       const maxLabelWidth = attribute.rx * 1.75;
       const trimmedLabel = fitText(context, attribute.label, maxLabelWidth);
       context.fillText(trimmedLabel, attribute.x, attribute.y + 1);
@@ -993,8 +1143,8 @@ function drawCanvasDiagram(
         context.beginPath();
         context.moveTo(attribute.x - textWidth / 2, attribute.y + 5);
         context.lineTo(attribute.x + textWidth / 2, attribute.y + 5);
-        context.strokeStyle = "#deebff";
-        context.lineWidth = 1.2;
+        context.strokeStyle = "#111111";
+        context.lineWidth = 1.1;
         context.stroke();
       }
     }
@@ -1008,7 +1158,7 @@ function drawCanvasDiagram(
         positionedEntity.height + 14,
         11,
       );
-      context.strokeStyle = "#d0e0f7";
+      context.strokeStyle = "#111111";
       context.lineWidth = 2;
       context.stroke();
     }
@@ -1021,14 +1171,14 @@ function drawCanvasDiagram(
       positionedEntity.height,
       10,
     );
-    context.fillStyle = "#16263a";
+    context.fillStyle = "#fdfdfd";
     context.fill();
-    context.strokeStyle = "#d0e0f7";
-    context.lineWidth = 3;
+    context.strokeStyle = "#111111";
+    context.lineWidth = 1.8;
     context.stroke();
 
     context.font = "700 25px Iowan Old Style, Palatino Linotype, Palatino, Garamond, serif";
-    context.fillStyle = "#f2f7ff";
+    context.fillStyle = "#111111";
     context.fillText(
       getShortName(positionedEntity.entity.name),
       positionedEntity.centerX,
@@ -1244,6 +1394,14 @@ export default function Home() {
     setErrorMessage("");
   };
 
+  const handleLoadBankExample = (): void => {
+    setSchemaInput(BANK_SAMPLE_SQL);
+    const parsed = parseSqlSchema(BANK_SAMPLE_SQL);
+    setDiagram(parsed);
+    setErrorMessage("");
+    setIsSchemaOpen(true);
+  };
+
   const handleDownload = async (): Promise<void> => {
     if (!canvasRef.current || diagram.entities.length === 0) {
       return;
@@ -1290,6 +1448,9 @@ export default function Home() {
             onClick={() => setIsSchemaOpen((current) => !current)}
           >
             {isSchemaOpen ? "Hide SQL" : "Show SQL"}
+          </button>
+          <button type="button" className="ghost-btn" onClick={handleLoadBankExample}>
+            Load Bank Example
           </button>
           <button type="button" className="primary-btn" onClick={handleGenerate}>
             Generate Diagram
@@ -1355,7 +1516,8 @@ export default function Home() {
 
         <p className="hint">
           Supported best with <code>CREATE TABLE</code>, <code>PRIMARY KEY</code>,{" "}
-          <code>FOREIGN KEY</code>, and inline <code>REFERENCES</code>.
+          <code>FOREIGN KEY</code>, and inline <code>REFERENCES</code>. Add NOT NULL
+          and UNIQUE on FK columns for stronger cardinality inference.
         </p>
 
         <div className="panel-stats">
@@ -1372,7 +1534,20 @@ export default function Home() {
           <span>Dashed oval: derived</span>
           <span>Double rectangle: weak entity</span>
           <span>Double line: total participation</span>
-          <span>Crow's Foot: o&lt;, o|, ||</span>
+          <span>Cardinality: 1 or N at each end</span>
+          <span>Relationship ratio: 1-N / N-1 below diamonds</span>
+        </div>
+
+        <div className="panel-guide">
+          <strong>ERD Steps</strong>
+          <ol>
+            <li>Identify entities from your schema.</li>
+            <li>Review attributes and PK highlights.</li>
+            <li>Check relationship diamonds and connectors.</li>
+            <li>Verify cardinality labels on both relationship sides.</li>
+            <li>Confirm total participation (double lines) where required.</li>
+            <li>Reposition using pan/zoom for clean readability.</li>
+          </ol>
         </div>
       </aside>
     </main>

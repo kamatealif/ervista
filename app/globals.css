@@ -331,6 +331,33 @@ body {
   color: rgba(213, 230, 251, 0.87);
 }
 
+.panel-guide {
+  display: flex;
+  flex-direction: column;
+  gap: 0.34rem;
+  padding: 0.56rem 0.62rem;
+  border-radius: 10px;
+  border: 1px solid rgba(155, 193, 235, 0.2);
+  background: rgba(11, 18, 28, 0.54);
+}
+
+.panel-guide strong {
+  font-size: 0.8rem;
+}
+
+.panel-guide ol {
+  margin: 0;
+  padding-left: 1rem;
+  display: grid;
+  gap: 0.24rem;
+}
+
+.panel-guide li {
+  font-family: var(--font-mono), "Courier New", monospace;
+  font-size: 0.72rem;
+  color: rgba(213, 230, 251, 0.87);
+}
+
 @media (max-width: 1180px) {
   .floating-toolbar {
     width: calc(100vw - 18px);
