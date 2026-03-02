@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useMemo, useState } from "react";
+import { useMemo, useState, useRef, useEffect } from "react";
 
 type DiagramAttribute = {
   name: string;
@@ -336,11 +336,11 @@ function parseSqlSchema(sql: string): DiagramModel {
       const keywordIndex = definition.search(
         /\s+(?:not\s+null|null|primary\s+key|references|unique|check|default|constraint|generated|collate|identity|auto_increment)\b/i,
       );
-      const type = (keywordIndex === -1
-        ? definition
-        : definition.slice(0, keywordIndex)
+      const type = (
+        keywordIndex === -1 ? definition : definition.slice(0, keywordIndex)
       ).trim();
-      const extras = keywordIndex === -1 ? "" : definition.slice(keywordIndex).trim();
+      const extras =
+        keywordIndex === -1 ? "" : definition.slice(keywordIndex).trim();
 
       const isPrimary = /\bprimary\s+key\b/i.test(extras);
       const isForeign = /\breferences\b/i.test(extras);
@@ -382,11 +382,11 @@ function hashTextToSeed(value: string): number {
     hash ^= value.charCodeAt(index);
     hash = Math.imul(hash, 16777619);
   }
-  return (hash >>> 0) || 1;
+  return hash >>> 0 || 1;
 }
 
 function createRuntimeSeed(): number {
-  return ((Date.now() ^ Math.floor(Math.random() * 0xffffffff)) >>> 0) || 1;
+  return (Date.now() ^ Math.floor(Math.random() * 0xffffffff)) >>> 0 || 1;
 }
 
 function createSeededRandom(seed: number): () => number {
@@ -409,7 +409,10 @@ function shuffleArray<T>(items: T[], random: () => number): T[] {
 }
 
 function getRectangleBorderCenterPoint(
-  rectangle: Pick<LayoutEntity, "x" | "y" | "width" | "height" | "centerX" | "centerY">,
+  rectangle: Pick<
+    LayoutEntity,
+    "x" | "y" | "width" | "height" | "centerX" | "centerY"
+  >,
   target: Point,
 ): Point {
   const dx = target.x - rectangle.centerX;
@@ -428,7 +431,10 @@ function getRectangleBorderCenterPoint(
   };
 }
 
-function buildDiagramLayout(model: DiagramModel, randomSeed: number): DiagramLayout {
+function buildDiagramLayout(
+  model: DiagramModel,
+  randomSeed: number,
+): DiagramLayout {
   if (model.entities.length === 0) {
     return { width: 1800, height: 1000, entities: [] };
   }
@@ -473,8 +479,12 @@ function buildDiagramLayout(model: DiagramModel, randomSeed: number): DiagramLay
     };
   });
 
-  const maxHalfWidth = Math.max(...entityMetrics.map((metric) => metric.halfWidth));
-  const maxHalfHeight = Math.max(...entityMetrics.map((metric) => metric.halfHeight));
+  const maxHalfWidth = Math.max(
+    ...entityMetrics.map((metric) => metric.halfWidth),
+  );
+  const maxHalfHeight = Math.max(
+    ...entityMetrics.map((metric) => metric.halfHeight),
+  );
 
   const cellWidth = maxHalfWidth * 2 + 90;
   const cellHeight = maxHalfHeight * 2 + 90;
@@ -505,32 +515,49 @@ function buildDiagramLayout(model: DiagramModel, randomSeed: number): DiagramLay
   }
   const shuffledSlots = shuffleArray(slotCenters, random);
 
-  const placedCenters: Array<Point & { halfWidth: number; halfHeight: number }> = [];
+  const placedCenters: Array<
+    Point & { halfWidth: number; halfHeight: number }
+  > = [];
 
-  const positionedEntities: LayoutEntity[] = entityMetrics.map((metric, index) => {
-    let centerX = minCenterX + random() * Math.max(1, maxCenterX - minCenterX);
-    let centerY = minCenterY + random() * Math.max(1, maxCenterY - minCenterY);
-    let placed = false;
+  const positionedEntities: LayoutEntity[] = entityMetrics.map(
+    (metric, index) => {
+      let centerX =
+        minCenterX + random() * Math.max(1, maxCenterX - minCenterX);
+      let centerY =
+        minCenterY + random() * Math.max(1, maxCenterY - minCenterY);
+      let placed = false;
 
-    for (let attempt = 0; attempt < 300; attempt += 1) {
-      const overlaps = placedCenters.some((center) => {
-        const dx = Math.abs(centerX - center.x);
-        const dy = Math.abs(centerY - center.y);
-        return (
-          dx < center.halfWidth + metric.halfWidth + 24 &&
-          dy < center.halfHeight + metric.halfHeight + 24
-        );
-      });
+      for (let attempt = 0; attempt < 300; attempt += 1) {
+        const overlaps = placedCenters.some((center) => {
+          const dx = Math.abs(centerX - center.x);
+          const dy = Math.abs(centerY - center.y);
+          return (
+            dx < center.halfWidth + metric.halfWidth + 24 &&
+            dy < center.halfHeight + metric.halfHeight + 24
+          );
+        });
 
-      if (!overlaps) {
-        placed = true;
-        break;
+        if (!overlaps) {
+          placed = true;
+          break;
+        }
+
+        if (attempt < 180) {
+          centerX =
+            minCenterX + random() * Math.max(1, maxCenterX - minCenterX);
+          centerY =
+            minCenterY + random() * Math.max(1, maxCenterY - minCenterY);
+        } else {
+          const slot = shuffledSlots[index % shuffledSlots.length] ?? {
+            x: width / 2,
+            y: height / 2,
+          };
+          centerX = slot.x;
+          centerY = slot.y;
+        }
       }
 
-      if (attempt < 180) {
-        centerX = minCenterX + random() * Math.max(1, maxCenterX - minCenterX);
-        centerY = minCenterY + random() * Math.max(1, maxCenterY - minCenterY);
-      } else {
+      if (!placed) {
         const slot = shuffledSlots[index % shuffledSlots.length] ?? {
           x: width / 2,
           y: height / 2,
@@ -538,86 +565,81 @@ function buildDiagramLayout(model: DiagramModel, randomSeed: number): DiagramLay
         centerX = slot.x;
         centerY = slot.y;
       }
-    }
 
-    if (!placed) {
-      const slot = shuffledSlots[index % shuffledSlots.length] ?? {
-        x: width / 2,
-        y: height / 2,
+      placedCenters.push({
+        x: centerX,
+        y: centerY,
+        halfWidth: metric.halfWidth,
+        halfHeight: metric.halfHeight,
+      });
+
+      const entityX = centerX - ENTITY_WIDTH / 2;
+      const entityY = centerY - ENTITY_HEIGHT / 2;
+
+      const entity: LayoutEntity = {
+        id: `entity-${metric.entity.name.toLowerCase()}`,
+        name: getShortName(metric.entity.name),
+        x: entityX,
+        y: entityY,
+        width: ENTITY_WIDTH,
+        height: ENTITY_HEIGHT,
+        centerX,
+        centerY,
+        attributes: [],
       };
-      centerX = slot.x;
-      centerY = slot.y;
-    }
 
-    placedCenters.push({
-      x: centerX,
-      y: centerY,
-      halfWidth: metric.halfWidth,
-      halfHeight: metric.halfHeight,
-    });
+      const count = metric.entity.attributes.length;
+      if (count > 0) {
+        for (
+          let attributeIndex = 0;
+          attributeIndex < count;
+          attributeIndex += 1
+        ) {
+          const attribute = metric.entity.attributes[attributeIndex];
+          const angle =
+            count === 1
+              ? -Math.PI / 2
+              : -Math.PI / 2 + (2 * Math.PI * attributeIndex) / count;
 
-    const entityX = centerX - ENTITY_WIDTH / 2;
-    const entityY = centerY - ENTITY_HEIGHT / 2;
+          const x = centerX + metric.orbitX * Math.cos(angle);
+          const y = centerY + metric.orbitY * Math.sin(angle);
 
-    const entity: LayoutEntity = {
-      id: `entity-${metric.entity.name.toLowerCase()}`,
-      name: getShortName(metric.entity.name),
-      x: entityX,
-      y: entityY,
-      width: ENTITY_WIDTH,
-      height: ENTITY_HEIGHT,
-      centerX,
-      centerY,
-      attributes: [],
-    };
+          const lineStart = getRectangleBorderCenterPoint(entity, { x, y });
+          const dx = x - lineStart.x;
+          const dy = y - lineStart.y;
+          const length = Math.max(1, Math.hypot(dx, dy));
+          const ux = (lineStart.x - x) / length;
+          const uy = (lineStart.y - y) / length;
+          const ellipseScale =
+            1 /
+            Math.sqrt(
+              (ux * ux) / (ATTRIBUTE_RX * ATTRIBUTE_RX) +
+                (uy * uy) / (ATTRIBUTE_RY * ATTRIBUTE_RY),
+            );
+          const lineEnd = {
+            x: x + ux * ellipseScale,
+            y: y + uy * ellipseScale,
+          };
 
-    const count = metric.entity.attributes.length;
-    if (count > 0) {
-      for (let attributeIndex = 0; attributeIndex < count; attributeIndex += 1) {
-        const attribute = metric.entity.attributes[attributeIndex];
-        const angle =
-          count === 1
-            ? -Math.PI / 2
-            : -Math.PI / 2 + (2 * Math.PI * attributeIndex) / count;
-
-        const x = centerX + metric.orbitX * Math.cos(angle);
-        const y = centerY + metric.orbitY * Math.sin(angle);
-
-        const lineStart = getRectangleBorderCenterPoint(entity, { x, y });
-        const dx = x - lineStart.x;
-        const dy = y - lineStart.y;
-        const length = Math.max(1, Math.hypot(dx, dy));
-        const ux = (lineStart.x - x) / length;
-        const uy = (lineStart.y - y) / length;
-        const ellipseScale =
-          1 /
-          Math.sqrt(
-            (ux * ux) / (ATTRIBUTE_RX * ATTRIBUTE_RX) +
-              (uy * uy) / (ATTRIBUTE_RY * ATTRIBUTE_RY),
-          );
-        const lineEnd = {
-          x: x + ux * ellipseScale,
-          y: y + uy * ellipseScale,
-        };
-
-        const suffix = `${attribute.isPrimary ? "*" : ""}${attribute.isForeign ? " fk" : ""}`;
-        entity.attributes.push({
-          id: `${entity.id}-attr-${attribute.name.toLowerCase()}`,
-          x,
-          y,
-          rx: ATTRIBUTE_RX,
-          ry: ATTRIBUTE_RY,
-          label: `${attribute.name}${suffix ? ` ${suffix}` : ""}`,
-          lineStart,
-          lineEnd,
-          isPrimary: attribute.isPrimary,
-          isForeign: attribute.isForeign,
-        });
+          const suffix = `${attribute.isPrimary ? "*" : ""}${attribute.isForeign ? " fk" : ""}`;
+          entity.attributes.push({
+            id: `${entity.id}-attr-${attribute.name.toLowerCase()}`,
+            x,
+            y,
+            rx: ATTRIBUTE_RX,
+            ry: ATTRIBUTE_RY,
+            label: `${attribute.name}${suffix ? ` ${suffix}` : ""}`,
+            lineStart,
+            lineEnd,
+            isPrimary: attribute.isPrimary,
+            isForeign: attribute.isForeign,
+          });
+        }
       }
-    }
 
-    return entity;
-  });
+      return entity;
+    },
+  );
 
   let minX = Number.POSITIVE_INFINITY;
   let minY = Number.POSITIVE_INFINITY;
@@ -693,7 +715,9 @@ function buildDiagramLayout(model: DiagramModel, randomSeed: number): DiagramLay
   return { width, height, entities: positionedEntities };
 }
 
-function buildExcalidrawSkeleton(layout: DiagramLayout): Record<string, unknown>[] {
+function buildExcalidrawSkeleton(
+  layout: DiagramLayout,
+): Record<string, unknown>[] {
   const skeleton: Record<string, unknown>[] = [];
 
   for (const entity of layout.entities) {
@@ -720,8 +744,6 @@ function buildExcalidrawSkeleton(layout: DiagramLayout): Record<string, unknown>
         x: attribute.lineStart.x,
         y: attribute.lineStart.y,
         points: connectorPoints,
-        strokeColor: "#64748b",
-        strokeWidth: 1.5,
         roughness: 0,
         elbowed: true,
         endArrowhead: "arrow",
@@ -737,16 +759,9 @@ function buildExcalidrawSkeleton(layout: DiagramLayout): Record<string, unknown>
       y: entity.y,
       width: entity.width,
       height: entity.height,
-      strokeColor: "#0f172a",
-      backgroundColor: "#ffffff",
-      strokeWidth: 2.2,
       roughness: 0,
-      fillStyle: "solid",
       label: {
         text: entity.name,
-        fontSize: 24,
-        textAlign: "center",
-        verticalAlign: "middle",
       },
     });
 
@@ -758,16 +773,9 @@ function buildExcalidrawSkeleton(layout: DiagramLayout): Record<string, unknown>
         y: attribute.y - attribute.ry,
         width: attribute.rx * 2,
         height: attribute.ry * 2,
-        strokeColor: attribute.isForeign ? "#1d4ed8" : "#334155",
-        backgroundColor: "#ffffff",
-        strokeWidth: attribute.isPrimary ? 2.2 : 1.8,
         roughness: 0,
-        fillStyle: "solid",
         label: {
           text: attribute.label,
-          fontSize: 14,
-          textAlign: "center",
-          verticalAlign: "middle",
         },
       });
     }
@@ -785,11 +793,17 @@ function fallbackModel(): DiagramModel {
 }
 
 export default function Home() {
+  // the raw SQL text is stored in state primarily for initial loading and hashing;
+  // the in‑page editing experience is handled by EditorJS instead of a plain textarea.
   const [schemaInput, setSchemaInput] = useState(SAMPLE_SQL);
+  const editorRef = useRef<EditorJS | null>(null);
+
   const [diagram, setDiagram] = useState<DiagramModel>(() => fallbackModel());
   const [errorMessage, setErrorMessage] = useState("");
   const [isSchemaOpen, setIsSchemaOpen] = useState(true);
-  const [layoutSeed, setLayoutSeed] = useState(() => hashTextToSeed(SAMPLE_SQL));
+  const [layoutSeed, setLayoutSeed] = useState(() =>
+    hashTextToSeed(SAMPLE_SQL),
+  );
 
   const layout = useMemo(
     () => buildDiagramLayout(diagram, layoutSeed),
@@ -800,9 +814,8 @@ export default function Home() {
     const skeleton = buildExcalidrawSkeleton(layout);
 
     return async () => {
-      const { convertToExcalidrawElements } = await import(
-        "@excalidraw/excalidraw"
-      );
+      const { convertToExcalidrawElements } =
+        await import("@excalidraw/excalidraw");
 
       return {
         elements: convertToExcalidrawElements(
@@ -811,14 +824,27 @@ export default function Home() {
         appState: {
           viewBackgroundColor: "#f8fafc",
           theme: "light" as const,
+          currentItemRoughness: 0,
         },
         scrollToContent: true,
       };
     };
   }, [layout]);
 
-  const handleGenerate = (): void => {
-    const parsed = parseSqlSchema(schemaInput);
+  // helper to read current SQL out of the editor instance
+  const getCurrentSql = async (): Promise<string> => {
+    if (editorRef.current) {
+      const saved = await editorRef.current.save();
+      return saved.blocks.map((b: any) => b.data?.text ?? "").join("\n");
+    }
+    return schemaInput;
+  };
+
+  const handleGenerate = async (): Promise<void> => {
+    const currentSql = await getCurrentSql();
+    setSchemaInput(currentSql);
+
+    const parsed = parseSqlSchema(currentSql);
     if (parsed.entities.length === 0) {
       setErrorMessage(
         "No CREATE TABLE statements were found. Paste a SQL schema and try again.",
@@ -831,6 +857,36 @@ export default function Home() {
     setLayoutSeed(createRuntimeSeed());
     setErrorMessage("");
   };
+
+  // initialize EditorJS once when the component mounts
+  useEffect(() => {
+    if (editorRef.current) {
+      return;
+    }
+
+    // load the EditorJS bundle only on the client
+    import("@editorjs/editorjs").then((mod) => {
+      const EditorJS = mod.default;
+      editorRef.current = new EditorJS({
+        holder: "editorjs",
+        data: {
+          blocks: [
+            {
+              type: "paragraph",
+              data: { text: schemaInput },
+            },
+          ],
+        },
+        placeholder: "Paste SQL CREATE TABLE statements here...",
+        autofocus: true,
+      });
+    });
+
+    return () => {
+      editorRef.current?.destroy();
+      editorRef.current = null;
+    };
+  }, [schemaInput]);
 
   return (
     <main className="h-screen w-screen bg-slate-100 text-slate-900">
@@ -848,7 +904,7 @@ export default function Home() {
         </button>
         <button
           type="button"
-          onClick={handleGenerate}
+          onClick={() => void handleGenerate()}
           className="rounded-md border border-blue-700 bg-blue-700 px-3 py-1.5 text-sm font-semibold text-white"
         >
           Generate
@@ -861,15 +917,14 @@ export default function Home() {
         }`}
       >
         <h2 className="text-sm font-semibold">SQL Schema</h2>
-        <textarea
-          value={schemaInput}
-          onChange={(event) => setSchemaInput(event.target.value)}
-          spellCheck={false}
-          className="h-full w-full resize-none rounded-xl border border-slate-300 bg-slate-50 p-3 font-mono text-xs leading-relaxed text-slate-800"
+        {/* EditorJS container replaces the textarea */}
+        <div
+          id="editorjs"
+          className="h-full w-full rounded-xl border border-slate-300 bg-slate-50 p-3 font-mono text-xs leading-relaxed text-slate-800"
         />
         <p className="text-xs text-slate-600">
-          Excalidraw is now the drawing engine. After generation, you can drag and
-          edit elements freely directly on the canvas.
+          Excalidraw is now the drawing engine. After generation, you can drag
+          and edit elements freely directly on the canvas.
         </p>
       </aside>
 
