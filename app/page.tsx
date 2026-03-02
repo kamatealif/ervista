@@ -644,6 +644,10 @@ function createSeededRandom(seed: number): () => number {
   };
 }
 
+function createRuntimeSeed(): number {
+  return ((Date.now() ^ Math.floor(Math.random() * 0xffffffff)) >>> 0) || 1;
+}
+
 function shuffleArray<T>(input: T[], random: () => number): T[] {
   const output = [...input];
   for (let index = output.length - 1; index > 0; index -= 1) {
@@ -656,67 +660,95 @@ function shuffleArray<T>(input: T[], random: () => number): T[] {
   return output;
 }
 
-function buildDiagramLayout(model: DiagramModel): DiagramLayout {
+function buildDiagramLayout(model: DiagramModel, randomSeed: number): DiagramLayout {
   if (model.entities.length === 0) {
     return { width: 1600, height: 900, entities: [], relationshipPaths: [] };
   }
+
+  const ENTITY_WIDTH = 280;
+  const ENTITY_HEIGHT = 104;
+  const ATTRIBUTE_RX = 96;
+  const ATTRIBUTE_RY = 26;
+  const ATTRIBUTE_EDGE_GAP = 132;
+  const ATTRIBUTE_SPACING = 84;
+  const ATTRIBUTE_CENTER_GAP = 52;
+  const RELATION_DIAMOND_CLEARANCE = 180;
+  const RELATION_LANE_STEP = 54;
+  const CANVAS_PADDING = 220;
+  const ATTRIBUTE_SIDE_SPACE = ATTRIBUTE_RX + ATTRIBUTE_EDGE_GAP + 48;
 
   const maxAttributes = Math.max(
     ...model.entities.map((entity) => Math.max(1, entity.attributes.length)),
   );
   const maxSideAttributes = Math.ceil(maxAttributes / 2);
 
-  const entityWidth = 280;
-  const entityHeight = 104;
-  const maxOvalRadius = 188;
-  const attributeToEntityGap = 124;
-  const sideSpace = maxOvalRadius + attributeToEntityGap + 22;
-
-  const cellWidth = Math.max(920, entityWidth + sideSpace * 2);
-  const cellHeight = Math.max(620, maxSideAttributes * 86 + 280);
-  const padding = 190;
+  const minCenterDistanceX = ENTITY_WIDTH + ATTRIBUTE_SIDE_SPACE * 2 + 120;
+  const minCenterDistanceY = Math.max(360, maxSideAttributes * ATTRIBUTE_SPACING * 0.72 + 210);
 
   const cols = Math.max(1, Math.ceil(Math.sqrt(model.entities.length)));
   const rows = Math.ceil(model.entities.length / cols);
 
-  const width = padding * 2 + cols * cellWidth;
-  const height = padding * 2 + rows * cellHeight;
+  const width = CANVAS_PADDING * 2 + cols * minCenterDistanceX;
+  const height = CANVAS_PADDING * 2 + rows * minCenterDistanceY;
+  const random = createSeededRandom(hashTextToSeed(`${randomSeed}:${model.entities.length}`));
 
-  const seedSource = [
-    ...model.entities.map((entity) => entity.name.toLowerCase()).sort(),
-    ...model.relationships
-      .map(
-        (relation) =>
-          `${relation.fromTable.toLowerCase()}.${relation.fromColumn.toLowerCase()}->${relation.toTable.toLowerCase()}.${relation.toColumn.toLowerCase()}`,
-      )
-      .sort(),
-  ].join("|");
-  const random = createSeededRandom(hashTextToSeed(seedSource));
+  const minCenterX = CANVAS_PADDING + ENTITY_WIDTH / 2 + ATTRIBUTE_SIDE_SPACE;
+  const maxCenterX = width - CANVAS_PADDING - ENTITY_WIDTH / 2 - ATTRIBUTE_SIDE_SPACE;
+  const minCenterY = CANVAS_PADDING + ENTITY_HEIGHT / 2 + 80;
+  const maxCenterY = height - CANVAS_PADDING - ENTITY_HEIGHT / 2 - 80;
 
-  const slots: Point[] = [];
+  const fallbackSlots: Point[] = [];
   for (let row = 0; row < rows; row += 1) {
     for (let col = 0; col < cols; col += 1) {
-      slots.push({
-        x: padding + col * cellWidth + cellWidth / 2,
-        y: padding + row * cellHeight + cellHeight / 2,
+      fallbackSlots.push({
+        x: CANVAS_PADDING + col * minCenterDistanceX + minCenterDistanceX / 2,
+        y: CANVAS_PADDING + row * minCenterDistanceY + minCenterDistanceY / 2,
       });
     }
   }
-  const shuffledSlots = shuffleArray(slots, random);
-  const maxJitterX = Math.min(132, cellWidth * 0.17);
-  const maxJitterY = Math.min(102, cellHeight * 0.16);
+  const shuffledFallbackSlots = shuffleArray(fallbackSlots, random);
+  const chosenCenters: Point[] = [];
 
   const positionedEntities: PositionedEntity[] = model.entities.map(
     (entity, index) => {
-      const slot = shuffledSlots[index] ??
-        slots[index % slots.length] ?? {
-          x: padding + cellWidth / 2,
-          y: padding + cellHeight / 2,
-        };
-      const centerX = slot.x + (random() - 0.5) * maxJitterX * 2;
-      const centerY = slot.y + (random() - 0.5) * maxJitterY * 2;
-      const x = centerX - entityWidth / 2;
-      const y = centerY - entityHeight / 2;
+      let centerX = minCenterX + random() * Math.max(1, maxCenterX - minCenterX);
+      let centerY = minCenterY + random() * Math.max(1, maxCenterY - minCenterY);
+      let placed = false;
+
+      for (let attempt = 0; attempt < 240; attempt += 1) {
+        const overlaps = chosenCenters.some((center) => {
+          const dx = Math.abs(centerX - center.x);
+          const dy = Math.abs(centerY - center.y);
+          return (
+            dx < minCenterDistanceX * 0.74 &&
+            dy < minCenterDistanceY * 0.74
+          );
+        });
+
+        if (!overlaps) {
+          placed = true;
+          break;
+        }
+
+        centerX = minCenterX + random() * Math.max(1, maxCenterX - minCenterX);
+        centerY = minCenterY + random() * Math.max(1, maxCenterY - minCenterY);
+      }
+
+      if (!placed) {
+        const fallback =
+          shuffledFallbackSlots[index % shuffledFallbackSlots.length] ??
+          fallbackSlots[index % fallbackSlots.length] ?? {
+            x: width / 2,
+            y: height / 2,
+          };
+        centerX = fallback.x;
+        centerY = fallback.y;
+      }
+
+      chosenCenters.push({ x: centerX, y: centerY });
+
+      const x = centerX - ENTITY_WIDTH / 2;
+      const y = centerY - ENTITY_HEIGHT / 2;
 
       const splitIndex = Math.ceil(entity.attributes.length / 2);
       const leftAttributes = entity.attributes.slice(0, splitIndex);
@@ -731,24 +763,27 @@ function buildDiagramLayout(model: DiagramModel): DiagramLayout {
           return;
         }
 
-        const spacing = 86;
-        const baseY = centerY - ((source.length - 1) * spacing) / 2;
+        const baseY = centerY - ((source.length - 1) * ATTRIBUTE_SPACING) / 2;
 
         source.forEach((attribute, listIndex) => {
-          const yPosition = baseY + listIndex * spacing;
+          let yPosition = baseY + listIndex * ATTRIBUTE_SPACING;
+          if (Math.abs(yPosition - centerY) < ATTRIBUTE_CENTER_GAP) {
+            yPosition += yPosition >= centerY ? ATTRIBUTE_CENTER_GAP : -ATTRIBUTE_CENTER_GAP;
+          }
+
           const label = createAttributeLabel(attribute);
-          const rx = Math.max(82, Math.min(maxOvalRadius, 26 + label.length * 3.15));
+          const rx = ATTRIBUTE_RX;
           const xPosition =
             side === "left"
-              ? x - attributeToEntityGap - rx
-              : x + entityWidth + attributeToEntityGap + rx;
+              ? x - ATTRIBUTE_EDGE_GAP - rx
+              : x + ENTITY_WIDTH + ATTRIBUTE_EDGE_GAP + rx;
 
           attributes.push({
             attribute,
             x: xPosition,
             y: yPosition,
             rx,
-            ry: 26,
+            ry: ATTRIBUTE_RY,
             label,
           });
         });
@@ -761,8 +796,8 @@ function buildDiagramLayout(model: DiagramModel): DiagramLayout {
         entity,
         x,
         y,
-        width: entityWidth,
-        height: entityHeight,
+        width: ENTITY_WIDTH,
+        height: ENTITY_HEIGHT,
         centerX,
         centerY,
         attributes,
@@ -793,30 +828,44 @@ function buildDiagramLayout(model: DiagramModel): DiagramLayout {
         y: fromEntity.centerY,
       });
 
-      const laneOffset = ((relationIndex % 7) - 3) * 22;
+      const laneOffset = ((relationIndex % 7) - 3) * RELATION_LANE_STEP;
       const horizontalDominant = Math.abs(end.x - start.x) >= Math.abs(end.y - start.y);
 
       const points: Point[] = [];
       let diamond: Point = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
 
       if (horizontalDominant) {
-        const midX = (start.x + end.x) / 2 + laneOffset;
-        diamond = { x: midX, y: (start.y + end.y) / 2 };
+        const midY = (start.y + end.y) / 2;
+        let corridorX = (start.x + end.x) / 2 + laneOffset;
+        const minX = Math.min(start.x, end.x) + RELATION_DIAMOND_CLEARANCE;
+        const maxX = Math.max(start.x, end.x) - RELATION_DIAMOND_CLEARANCE;
+        if (minX < maxX) {
+          corridorX = Math.min(maxX, Math.max(minX, corridorX));
+        }
+
+        diamond = { x: corridorX, y: midY };
         points.push(
           start,
-          { x: midX, y: start.y },
+          { x: corridorX, y: start.y },
           diamond,
-          { x: midX, y: end.y },
+          { x: corridorX, y: end.y },
           end,
         );
       } else {
-        const midY = (start.y + end.y) / 2 + laneOffset;
-        diamond = { x: (start.x + end.x) / 2, y: midY };
+        const midX = (start.x + end.x) / 2;
+        let corridorY = (start.y + end.y) / 2 + laneOffset;
+        const minY = Math.min(start.y, end.y) + RELATION_DIAMOND_CLEARANCE;
+        const maxY = Math.max(start.y, end.y) - RELATION_DIAMOND_CLEARANCE;
+        if (minY < maxY) {
+          corridorY = Math.min(maxY, Math.max(minY, corridorY));
+        }
+
+        diamond = { x: midX, y: corridorY };
         points.push(
           start,
-          { x: start.x, y: midY },
+          { x: start.x, y: corridorY },
           diamond,
-          { x: end.x, y: midY },
+          { x: end.x, y: corridorY },
           end,
         );
       }
@@ -1062,8 +1111,8 @@ function drawCanvasDiagram(
     context.font = "600 16px Iowan Old Style, Palatino Linotype, Palatino, Garamond, serif";
     const relationLabel = fitText(context, route.label, 128);
     const relationTextWidth = context.measureText(relationLabel).width;
-    const diamondWidth = Math.max(96, relationTextWidth + 44);
-    const diamondHeight = 54;
+    const diamondWidth = Math.min(164, Math.max(112, relationTextWidth + 44));
+    const diamondHeight = 64;
     const cx = route.diamond.x;
     const cy = route.diamond.y;
 
@@ -1081,11 +1130,11 @@ function drawCanvasDiagram(
 
     context.font = "600 14px Iowan Old Style, Palatino Linotype, Palatino, Garamond, serif";
     context.fillStyle = "#111111";
-    context.fillText(relationLabel, cx, cy + 1);
+    context.fillText(relationLabel, cx, cy - 7);
 
     context.font = "700 13px Menlo, Monaco, Consolas, 'Courier New', monospace";
     context.fillStyle = "#111111";
-    context.fillText(relationRatio, cx, cy + diamondHeight / 2 + 16);
+    context.fillText(relationRatio, cx, cy + 12);
   }
 
   for (const positionedEntity of layout.entities) {
@@ -1247,11 +1296,15 @@ export default function Home() {
     initialized: false,
   });
   const [isPanning, setIsPanning] = useState(false);
+  const [layoutSeed, setLayoutSeed] = useState(() => hashTextToSeed(SAMPLE_SQL));
 
   const panPointerRef = useRef<Point | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  const layout = useMemo(() => buildDiagramLayout(diagram), [diagram]);
+  const layout = useMemo(
+    () => buildDiagramLayout(diagram, layoutSeed),
+    [diagram, layoutSeed],
+  );
 
   useEffect(() => {
     const updateViewport = (): void => {
@@ -1391,6 +1444,7 @@ export default function Home() {
     }
 
     setDiagram(parsed);
+    setLayoutSeed(createRuntimeSeed());
     setErrorMessage("");
   };
 
@@ -1398,6 +1452,7 @@ export default function Home() {
     setSchemaInput(BANK_SAMPLE_SQL);
     const parsed = parseSqlSchema(BANK_SAMPLE_SQL);
     setDiagram(parsed);
+    setLayoutSeed(createRuntimeSeed());
     setErrorMessage("");
     setIsSchemaOpen(true);
   };
