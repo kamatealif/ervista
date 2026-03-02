@@ -9,6 +9,7 @@ type DiagramAttribute = {
   type: string;
   isPrimary: boolean;
   isForeign: boolean;
+  references?: string; // normalized table name if this column references another table
 };
 
 type DiagramEntity = {
@@ -293,6 +294,7 @@ function parseSqlSchema(sql: string): DiagramModel {
     const attributes: DiagramAttribute[] = [];
     const primaryKeyColumns = new Set<string>();
     const foreignKeyColumns = new Set<string>();
+    const foreignRefs: Record<string, string> = {};
 
     for (const originalSection of sections) {
       let section = originalSection.trim();
@@ -319,9 +321,12 @@ function parseSqlSchema(sql: string): DiagramModel {
         /^foreign\s+key\s*\(([^)]+)\)\s*references\s+([^\s(]+)\s*\(([^)]+)\)/i,
       );
       if (foreignMatch) {
-        parseIdentifierList(foreignMatch[1]).forEach((column) =>
-          foreignKeyColumns.add(column.toLowerCase()),
-        );
+        const referenced = normalizeIdentifier(foreignMatch[2]);
+        parseIdentifierList(foreignMatch[1]).forEach((column) => {
+          const key = column.toLowerCase();
+          foreignKeyColumns.add(key);
+          foreignRefs[key] = referenced;
+        });
         continue;
       }
 
@@ -353,11 +358,19 @@ function parseSqlSchema(sql: string): DiagramModel {
         foreignKeyColumns.add(columnName.toLowerCase());
       }
 
+      // check extras for explicit references to extract target table
+      let references: string | undefined;
+      const refMatch = extras.match(/references\s+([^\s(]+)/i);
+      if (refMatch) {
+        references = normalizeIdentifier(refMatch[1]);
+      }
+
       attributes.push({
         name: columnName,
         type,
         isPrimary,
         isForeign,
+        references,
       });
     }
 
@@ -449,6 +462,8 @@ function buildDiagramLayout(
   const ATTRIBUTE_MIN_ARC_GAP = 18;
   const CANVAS_PADDING = 220;
   const CONTENT_MARGIN = 220;
+  // extra space between cells to avoid attributes of adjacent entities overlapping
+  const CELL_GAP = 160;
 
   const baseOrbitX = ENTITY_WIDTH / 2 + ATTRIBUTE_EDGE_GAP + ATTRIBUTE_RX;
   const baseOrbitY = ENTITY_HEIGHT / 2 + ATTRIBUTE_EDGE_GAP + ATTRIBUTE_RY;
@@ -487,8 +502,8 @@ function buildDiagramLayout(
     ...entityMetrics.map((metric) => metric.halfHeight),
   );
 
-  const cellWidth = maxHalfWidth * 2 + 90;
-  const cellHeight = maxHalfHeight * 2 + 90;
+  const cellWidth = maxHalfWidth * 2 + 90 + CELL_GAP;
+  const cellHeight = maxHalfHeight * 2 + 90 + CELL_GAP;
 
   const cols = Math.max(1, Math.ceil(Math.sqrt(entityMetrics.length)));
   const rows = Math.ceil(entityMetrics.length / cols);
@@ -721,33 +736,114 @@ function buildExcalidrawSkeleton(
 ): Record<string, unknown>[] {
   const skeleton: Record<string, unknown>[] = [];
 
+  const DIAMOND_SIZE = 24;
+
+  // draw relationships between tables (attributes with references)
   for (const entity of layout.entities) {
     for (const attribute of entity.attributes) {
-      const deltaX = attribute.lineEnd.x - attribute.lineStart.x;
-      const deltaY = attribute.lineEnd.y - attribute.lineStart.y;
-      const connectorPoints =
-        Math.abs(deltaX) >= Math.abs(deltaY)
+      if (!attribute.references) continue;
+      const target = layout.entities.find(
+        (e) =>
+          getShortName(e.name).toLowerCase() ===
+          getShortName(attribute.references!).toLowerCase(),
+      );
+      if (!target) continue;
+
+      const midX = (entity.centerX + target.centerX) / 2;
+      const midY = (entity.centerY + target.centerY) / 2;
+
+      // place a diamond at midpoint to represent the relationship
+      skeleton.push({
+        id: `rel-${entity.id}-${target.id}`,
+        type: "diamond",
+        x: midX - DIAMOND_SIZE / 2,
+        y: midY - DIAMOND_SIZE / 2,
+        width: DIAMOND_SIZE,
+        height: DIAMOND_SIZE,
+        roughness: 0,
+      });
+
+      // arrow from entity to diamond (elbowed)
+      const startPoint = getRectangleBorderCenterPoint(entity, {
+        x: midX,
+        y: midY,
+      });
+      const dx1 = midX - startPoint.x;
+      const dy1 = midY - startPoint.y;
+      const points1 =
+        Math.abs(dx1) >= Math.abs(dy1)
           ? [
               [0, 0],
-              [deltaX * 0.6, 0],
-              [deltaX * 0.6, deltaY],
-              [deltaX, deltaY],
+              [dx1 * 0.6, 0],
+              [dx1 * 0.6, dy1],
+              [dx1, dy1],
             ]
           : [
               [0, 0],
-              [0, deltaY * 0.6],
-              [deltaX, deltaY * 0.6],
-              [deltaX, deltaY],
+              [0, dy1 * 0.6],
+              [dx1, dy1 * 0.6],
+              [dx1, dy1],
             ];
-
       skeleton.push({
         type: "arrow",
-        x: attribute.lineStart.x,
-        y: attribute.lineStart.y,
-        points: connectorPoints,
+        x: startPoint.x,
+        y: startPoint.y,
+        points: points1,
         roughness: 0,
         elbowed: true,
+        straight: false,
         endArrowhead: "arrow",
+      });
+
+      // arrow from diamond to target entity (elbowed)
+      const endPoint = getRectangleBorderCenterPoint(target, {
+        x: midX,
+        y: midY,
+      });
+      const dx2 = endPoint.x - midX;
+      const dy2 = endPoint.y - midY;
+      const points2 =
+        Math.abs(dx2) >= Math.abs(dy2)
+          ? [
+              [0, 0],
+              [dx2 * 0.6, 0],
+              [dx2 * 0.6, dy2],
+              [dx2, dy2],
+            ]
+          : [
+              [0, 0],
+              [0, dy2 * 0.6],
+              [dx2, dy2 * 0.6],
+              [dx2, dy2],
+            ];
+      skeleton.push({
+        type: "arrow",
+        x: midX,
+        y: midY,
+        points: points2,
+        roughness: 0,
+        elbowed: true,
+        straight: false,
+        endArrowhead: attribute.isForeign ? "diamond" : "arrow",
+      });
+    }
+  }
+
+  // draw simple lines connecting each attribute oval to its entity
+  for (const entity of layout.entities) {
+    for (const attribute of entity.attributes) {
+      skeleton.push({
+        type: "line",
+        x: attribute.lineStart.x,
+        y: attribute.lineStart.y,
+        points: [
+          [0, 0],
+          [
+            attribute.lineEnd.x - attribute.lineStart.x,
+            attribute.lineEnd.y - attribute.lineStart.y,
+          ],
+        ],
+        roughness: 0,
       });
     }
   }
@@ -949,7 +1045,7 @@ export default function Home() {
       </div>
 
       <aside
-        className={`absolute right-4 top-16 z-20 flex h-[calc(100vh-5rem)] w-[420px] flex-col gap-3 rounded-2xl border border-slate-300 bg-white/95 p-3 shadow-xl transition-transform ${
+        className={`absolute right-4 top-16 z-20 flex h-[calc(100vh-5rem)] w-[420px] flex-col gap-3 rounded-2xl border border-slate-300 bg-white/95 p-3 shadow-xl transition-transform min-h-0 ${
           isSchemaOpen ? "translate-x-0" : "translate-x-[470px]"
         }`}
       >
@@ -957,7 +1053,7 @@ export default function Home() {
         {/* EditorJS container replaces the textarea */}
         <div
           id="editorjs"
-          className="h-full w-full rounded-xl border border-slate-300 bg-slate-50 p-3 font-mono text-xs leading-relaxed text-slate-800 whitespace-pre-wrap"
+          className="flex-1 w-full rounded-xl border border-slate-300 bg-slate-50 p-3 font-mono text-xs leading-relaxed text-slate-800 whitespace-pre-wrap overflow-auto"
         />
         <p className="text-xs text-slate-600">
           Excalidraw is now the drawing engine. After generation, you can drag
