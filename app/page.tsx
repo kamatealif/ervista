@@ -2,6 +2,7 @@
 
 import dynamic from "next/dynamic";
 import { useMemo, useState, useRef, useEffect } from "react";
+import { format as formatSql } from "sql-formatter";
 
 type DiagramAttribute = {
   name: string;
@@ -796,7 +797,7 @@ export default function Home() {
   // the raw SQL text is stored in state primarily for initial loading and hashing;
   // the in‑page editing experience is handled by EditorJS instead of a plain textarea.
   const [schemaInput, setSchemaInput] = useState(SAMPLE_SQL);
-  const editorRef = useRef<EditorJS | null>(null);
+  const editorRef = useRef<any>(null);
 
   const [diagram, setDiagram] = useState<DiagramModel>(() => fallbackModel());
   const [errorMessage, setErrorMessage] = useState("");
@@ -835,13 +836,36 @@ export default function Home() {
   const getCurrentSql = async (): Promise<string> => {
     if (editorRef.current) {
       const saved = await editorRef.current.save();
-      return saved.blocks.map((b: any) => b.data?.text ?? "").join("\n");
+      const lines: string[] = [];
+      for (const b of saved.blocks) {
+        if (b.type === "code") {
+          lines.push(b.data.code);
+        } else if (b.type === "paragraph") {
+          lines.push(b.data.text);
+        }
+      }
+      return lines.join("\n");
     }
     return schemaInput;
   };
 
   const handleGenerate = async (): Promise<void> => {
-    const currentSql = await getCurrentSql();
+    let currentSql = await getCurrentSql();
+
+    // run formatter to normalize SQL (client-side only)
+    try {
+      currentSql = formatSql(currentSql, { language: "sql", uppercase: true });
+    } catch (e) {
+      // ignore formatting errors
+    }
+
+    // reflect formatted text back into the editor
+    if (editorRef.current) {
+      await editorRef.current.render({
+        blocks: [{ type: "code", data: { code: currentSql, language: "sql" } }],
+      });
+    }
+
     setSchemaInput(currentSql);
 
     const parsed = parseSqlSchema(currentSql);
@@ -864,29 +888,42 @@ export default function Home() {
       return;
     }
 
-    // load the EditorJS bundle only on the client
-    import("@editorjs/editorjs").then((mod) => {
-      const EditorJS = mod.default;
-      editorRef.current = new EditorJS({
-        holder: "editorjs",
-        data: {
-          blocks: [
-            {
-              type: "paragraph",
-              data: { text: schemaInput },
+    // dynamic imports to avoid SSR issues
+    Promise.all([import("@editorjs/editorjs"), import("@editorjs/code")]).then(
+      ([mod, codeMod]) => {
+        const EditorJS = mod.default;
+        const CodeTool = codeMod.default;
+
+        editorRef.current = new EditorJS({
+          holder: "editorjs",
+          tools: {
+            code: {
+              class: CodeTool,
+              config: {
+                language: "sql",
+              },
             },
-          ],
-        },
-        placeholder: "Paste SQL CREATE TABLE statements here...",
-        autofocus: true,
-      });
-    });
+          },
+          data: {
+            blocks: [
+              {
+                type: "code",
+                data: { code: schemaInput, language: "sql" },
+              },
+            ],
+          },
+          placeholder: "Paste SQL CREATE TABLE statements here...",
+          autofocus: true,
+          initialBlock: "code",
+        });
+      },
+    );
 
     return () => {
       editorRef.current?.destroy();
       editorRef.current = null;
     };
-  }, [schemaInput]);
+  }, []);
 
   return (
     <main className="h-screen w-screen bg-slate-100 text-slate-900">
@@ -920,7 +957,7 @@ export default function Home() {
         {/* EditorJS container replaces the textarea */}
         <div
           id="editorjs"
-          className="h-full w-full rounded-xl border border-slate-300 bg-slate-50 p-3 font-mono text-xs leading-relaxed text-slate-800"
+          className="h-full w-full rounded-xl border border-slate-300 bg-slate-50 p-3 font-mono text-xs leading-relaxed text-slate-800 whitespace-pre-wrap"
         />
         <p className="text-xs text-slate-600">
           Excalidraw is now the drawing engine. After generation, you can drag
