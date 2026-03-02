@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import "@excalidraw/excalidraw/index.css";
 
 export const metadata: Metadata = {
   title: "Traditional ER Diagram Generator",
