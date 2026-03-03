@@ -740,8 +740,7 @@ function buildExcalidrawSkeleton(
 ): Record<string, unknown>[] {
   const skeleton: Record<string, unknown>[] = [];
 
-  const DIAMOND_WIDTH = 50;
-  const DIAMOND_HEIGHT = 30;
+  const DIAMOND_SIZE = 50;
 
   function getRelationshipType(
     sourceEntity: LayoutEntity,
@@ -807,8 +806,8 @@ function buildExcalidrawSkeleton(
     targetX: number,
     targetY: number,
   ): Point {
-    const hw = DIAMOND_WIDTH / 2;
-    const hh = DIAMOND_HEIGHT / 2;
+    const hw = DIAMOND_SIZE / 2;
+    const hh = DIAMOND_SIZE / 2;
     const cx = diamondX + hw;
     const cy = diamondY + hh;
     const dx = targetX - cx;
@@ -891,10 +890,10 @@ function buildExcalidrawSkeleton(
       shapes.push({
         id: `rel-${entity.id}-${target.id}`,
         type: "diamond",
-        x: midX - DIAMOND_WIDTH / 2,
-        y: midY - DIAMOND_HEIGHT / 2,
-        width: DIAMOND_WIDTH,
-        height: DIAMOND_HEIGHT,
+        x: midX - DIAMOND_SIZE / 2,
+        y: midY - DIAMOND_SIZE / 2,
+        width: DIAMOND_SIZE,
+        height: DIAMOND_SIZE,
         roughness: 0,
         label: {
           text: relType,
@@ -905,7 +904,7 @@ function buildExcalidrawSkeleton(
         id: `label-1n-${entity.id}-${target.id}`,
         type: "text",
         x: midX - 30,
-        y: midY - DIAMOND_HEIGHT / 2 - 18,
+        y: midY - DIAMOND_SIZE / 2 - 18,
         text: cardinality,
         fontSize: 11,
       });
@@ -914,15 +913,15 @@ function buildExcalidrawSkeleton(
         id: `label-n1-${entity.id}-${target.id}`,
         type: "text",
         x: midX + 10,
-        y: midY + DIAMOND_HEIGHT / 2 + 2,
+        y: midY + DIAMOND_SIZE / 2 + 2,
         text: getCardinalityTarget(entity, target, attribute),
         fontSize: 11,
       });
 
       const entityCorner = getEntityCornerPoint(entity, midX, midY);
       const diamondEntry = getDiamondEdgePoint(
-        midX - DIAMOND_WIDTH / 2,
-        midY - DIAMOND_HEIGHT / 2,
+        midX - DIAMOND_SIZE / 2,
+        midY - DIAMOND_SIZE / 2,
         entityCorner.x,
         entityCorner.y,
       );
@@ -943,8 +942,8 @@ function buildExcalidrawSkeleton(
 
       const targetCorner = getEntityCornerPoint(target, midX, midY);
       const diamondExit = getDiamondEdgePoint(
-        midX - DIAMOND_WIDTH / 2,
-        midY - DIAMOND_HEIGHT / 2,
+        midX - DIAMOND_SIZE / 2,
+        midY - DIAMOND_SIZE / 2,
         targetCorner.x,
         targetCorner.y,
       );
