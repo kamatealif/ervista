@@ -740,7 +740,9 @@ function buildExcalidrawSkeleton(
 ): Record<string, unknown>[] {
   const skeleton: Record<string, unknown>[] = [];
 
-  const DIAMOND_SIZE = 50;
+  const DIAMOND_WIDTH = 120;
+  const DIAMOND_HEIGHT = 30;
+  const LINE_OFFSET = 50;
 
   function getRelationshipType(
     sourceEntity: LayoutEntity,
@@ -806,8 +808,8 @@ function buildExcalidrawSkeleton(
     targetX: number,
     targetY: number,
   ): Point {
-    const hw = DIAMOND_SIZE / 2;
-    const hh = DIAMOND_SIZE / 2;
+    const hw = DIAMOND_WIDTH / 2;
+    const hh = DIAMOND_WIDTH / 2;
     const cx = diamondX + hw;
     const cy = diamondY + hh;
     const dx = targetX - cx;
@@ -859,6 +861,22 @@ function buildExcalidrawSkeleton(
           text: attribute.label,
         },
       });
+
+      if (attribute.isPrimary) {
+        const labelWidth = attribute.label.length * 7;
+        shapes.push({
+          id: `${attribute.id}-underline`,
+          type: "line",
+          x: attribute.x - labelWidth / 2,
+          y: attribute.y + attribute.ry - 2,
+          points: [
+            [0, 0],
+            [labelWidth, 0],
+          ],
+          roughness: 0,
+          strokeStyle: "solid",
+        });
+      }
     }
   }
 
@@ -873,9 +891,6 @@ function buildExcalidrawSkeleton(
       if (!target) continue;
       if (!attribute.isForeign) continue;
 
-      const midX = (entity.centerX + target.centerX) / 2;
-      const midY = (entity.centerY + target.centerY) / 2;
-
       const relType = getRelationshipType(
         entity,
         target,
@@ -887,81 +902,73 @@ function buildExcalidrawSkeleton(
         attribute,
       );
 
+      const midX = (entity.centerX + target.centerX) / 2;
+      const midY = (entity.centerY + target.centerY) / 2;
+
       shapes.push({
         id: `rel-${entity.id}-${target.id}`,
         type: "diamond",
-        x: midX - DIAMOND_SIZE / 2,
-        y: midY - DIAMOND_SIZE / 2,
-        width: DIAMOND_SIZE,
-        height: DIAMOND_SIZE,
+        x: midX - DIAMOND_WIDTH / 2,
+        y: midY - DIAMOND_HEIGHT / 2,
+        width: DIAMOND_WIDTH,
+        height: DIAMOND_HEIGHT,
         roughness: 0,
         label: {
           text: relType,
         },
       });
 
-      shapes.push({
-        id: `label-1n-${entity.id}-${target.id}`,
-        type: "text",
-        x: midX - 30,
-        y: midY - DIAMOND_SIZE / 2 - 18,
-        text: cardinality,
-        fontSize: 11,
-      });
-
-      shapes.push({
-        id: `label-n1-${entity.id}-${target.id}`,
-        type: "text",
-        x: midX + 10,
-        y: midY + DIAMOND_SIZE / 2 + 2,
-        text: getCardinalityTarget(entity, target, attribute),
-        fontSize: 11,
-      });
-
       const entityCorner = getEntityCornerPoint(entity, midX, midY);
-      const diamondEntry = getDiamondEdgePoint(
-        midX - DIAMOND_SIZE / 2,
-        midY - DIAMOND_SIZE / 2,
-        entityCorner.x,
-        entityCorner.y,
-      );
-      const dx1 = diamondEntry.x - entityCorner.x;
-      const dy1 = diamondEntry.y - entityCorner.y;
+      const dx1 = entityCorner.x < midX ? LINE_OFFSET : -LINE_OFFSET;
+      const startX = entityCorner.x + dx1;
+      const startY = entityCorner.y;
+      const endX = midX + (entityCorner.x < midX ? -DIAMOND_WIDTH / 2 - 5 : DIAMOND_WIDTH / 2 + 5);
+      const endY = midY;
+      
       arrows.push({
-        type: "arrow",
-        x: entityCorner.x,
-        y: entityCorner.y,
+        type: "line",
+        x: startX,
+        y: startY,
         points: [
           [0, 0],
-          [dx1, dy1],
+          [endX - startX, endY - startY],
         ],
         roughness: 0,
         straight: true,
-        endArrowhead: "arrow",
+        startArrowhead: null,
+        endArrowhead: null,
+        label: {
+          text: cardinality,
+        },
+        labelPosition: 0.5,
       });
 
       const targetCorner = getEntityCornerPoint(target, midX, midY);
-      const diamondExit = getDiamondEdgePoint(
-        midX - DIAMOND_SIZE / 2,
-        midY - DIAMOND_SIZE / 2,
-        targetCorner.x,
-        targetCorner.y,
-      );
-      const dx2 = targetCorner.x - diamondExit.x;
-      const dy2 = targetCorner.y - diamondExit.y;
+      const dx2 = targetCorner.x < midX ? -LINE_OFFSET : LINE_OFFSET;
+      const startX2 = targetCorner.x + dx2;
+      const startY2 = targetCorner.y;
+      const endX2 = midX + (targetCorner.x < midX ? -DIAMOND_WIDTH / 2 - 5 : DIAMOND_WIDTH / 2 + 5);
+      const endY2 = midY;
+
       arrows.push({
-        type: "arrow",
-        x: diamondExit.x,
-        y: diamondExit.y,
+        type: "line",
+        x: startX2,
+        y: startY2,
         points: [
           [0, 0],
-          [dx2, dy2],
+          [endX2 - startX2, endY2 - startY2],
         ],
         roughness: 0,
         straight: true,
-        endArrowhead: "arrow",
+        startArrowhead: null,
+        endArrowhead: null,
+        label: {
+          text: getCardinalityTarget(entity, target, attribute),
+        },
+        labelPosition: 0.5,
       });
     }
+  }
   }
 
   for (const entity of layout.entities) {
