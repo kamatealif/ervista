@@ -751,7 +751,7 @@ function buildExcalidrawSkeleton(
     if (attribute.isPrimary && attribute.isForeign) {
       return "";
     }
-    return "";
+    return "has";
   }
 
   function getCardinality(
@@ -763,6 +763,17 @@ function buildExcalidrawSkeleton(
       return "1-1";
     }
     return "1-n";
+  }
+
+  function getCardinalityTarget(
+    sourceEntity: LayoutEntity,
+    targetEntity: LayoutEntity,
+    attribute: LayoutAttribute,
+  ): string {
+    if (attribute.isPrimary && attribute.isForeign) {
+      return "1-1";
+    }
+    return "n-1";
   }
 
   function getEntityCornerPoint(
@@ -890,6 +901,24 @@ function buildExcalidrawSkeleton(
         },
       });
 
+      shapes.push({
+        id: `label-1n-${entity.id}-${target.id}`,
+        type: "text",
+        x: midX - 30,
+        y: midY - DIAMOND_HEIGHT / 2 - 18,
+        text: cardinality,
+        fontSize: 11,
+      });
+
+      shapes.push({
+        id: `label-n1-${entity.id}-${target.id}`,
+        type: "text",
+        x: midX + 10,
+        y: midY + DIAMOND_HEIGHT / 2 + 2,
+        text: getCardinalityTarget(entity, target, attribute),
+        fontSize: 11,
+      });
+
       const entityCorner = getEntityCornerPoint(entity, midX, midY);
       const diamondEntry = getDiamondEdgePoint(
         midX - DIAMOND_WIDTH / 2,
@@ -910,9 +939,6 @@ function buildExcalidrawSkeleton(
         roughness: 0,
         straight: true,
         endArrowhead: "arrow",
-        label: {
-          text: cardinality,
-        },
       });
 
       const targetCorner = getEntityCornerPoint(target, midX, midY);
@@ -935,9 +961,6 @@ function buildExcalidrawSkeleton(
         roughness: 0,
         straight: true,
         endArrowhead: "arrow",
-        label: {
-          text: cardinality === "1-1" ? "1-1" : "n-1",
-        },
       });
     }
   }
