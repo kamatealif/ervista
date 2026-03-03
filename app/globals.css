@@ -408,3 +408,51 @@ body {
     font-size: 0.8rem;
   }
 }
+
+#editorjs {
+  height: 100%;
+  width: 100%;
+  font-family: monospace;
+}
+
+#editorjs .code-editor {
+  height: 100% !important;
+  min-height: unset !important;
+  font-family: monospace !important;
+  font-size: 13px !important;
+  line-height: 1.6 !important;
+  padding: 12px !important;
+  background: #f8f9fa !important;
+  border: none !important;
+  border-radius: 4px !important;
+}
+
+#editorjs .code-editor__textarea {
+  height: 100% !important;
+  min-height: unset !important;
+  background: transparent !important;
+}
+
+.ce-block__content {
+  max-width: 100% !important;
+}
+
+.ce-toolbar__content {
+  max-width: 100% !important;
+}
+
+.ce-toolbar {
+  display: none !important;
+}
+
+.ce-header {
+  display: none !important;
+}
+
+.code-editor {
+  background: #f8f9fa !important;
+}
+
+.code-editor__textarea {
+  background: transparent !important;
+}

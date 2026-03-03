@@ -1,8 +1,9 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useMemo, useState, useRef, useEffect } from "react";
+import { useMemo, useState, useCallback } from "react";
 import { format as formatSql } from "sql-formatter";
+import Editor from "@monaco-editor/react";
 
 type DiagramAttribute = {
   name: string;
@@ -37,6 +38,7 @@ type LayoutAttribute = {
   lineEnd: Point;
   isPrimary: boolean;
   isForeign: boolean;
+  references?: string;
 };
 
 type LayoutEntity = {
@@ -382,6 +384,7 @@ function parseSqlSchema(sql: string): DiagramModel {
           ...attribute,
           isPrimary: attribute.isPrimary || primaryKeyColumns.has(key),
           isForeign: attribute.isForeign || foreignKeyColumns.has(key),
+          references: attribute.references || foreignRefs[key],
         };
       }),
     });
@@ -649,6 +652,7 @@ function buildDiagramLayout(
             lineEnd,
             isPrimary: attribute.isPrimary,
             isForeign: attribute.isForeign,
+            references: attribute.references,
           });
         }
       }
@@ -736,120 +740,90 @@ function buildExcalidrawSkeleton(
 ): Record<string, unknown>[] {
   const skeleton: Record<string, unknown>[] = [];
 
-  const DIAMOND_SIZE = 24;
+  const DIAMOND_WIDTH = 50;
+  const DIAMOND_HEIGHT = 30;
 
-  // draw relationships between tables (attributes with references)
-  for (const entity of layout.entities) {
-    for (const attribute of entity.attributes) {
-      if (!attribute.references) continue;
-      const target = layout.entities.find(
-        (e) =>
-          getShortName(e.name).toLowerCase() ===
-          getShortName(attribute.references!).toLowerCase(),
-      );
-      if (!target) continue;
-
-      const midX = (entity.centerX + target.centerX) / 2;
-      const midY = (entity.centerY + target.centerY) / 2;
-
-      // place a diamond at midpoint to represent the relationship
-      skeleton.push({
-        id: `rel-${entity.id}-${target.id}`,
-        type: "diamond",
-        x: midX - DIAMOND_SIZE / 2,
-        y: midY - DIAMOND_SIZE / 2,
-        width: DIAMOND_SIZE,
-        height: DIAMOND_SIZE,
-        roughness: 0,
-      });
-
-      // arrow from entity to diamond (elbowed)
-      const startPoint = getRectangleBorderCenterPoint(entity, {
-        x: midX,
-        y: midY,
-      });
-      const dx1 = midX - startPoint.x;
-      const dy1 = midY - startPoint.y;
-      const points1 =
-        Math.abs(dx1) >= Math.abs(dy1)
-          ? [
-              [0, 0],
-              [dx1 * 0.6, 0],
-              [dx1 * 0.6, dy1],
-              [dx1, dy1],
-            ]
-          : [
-              [0, 0],
-              [0, dy1 * 0.6],
-              [dx1, dy1 * 0.6],
-              [dx1, dy1],
-            ];
-      skeleton.push({
-        type: "arrow",
-        x: startPoint.x,
-        y: startPoint.y,
-        points: points1,
-        roughness: 0,
-        elbowed: true,
-        straight: false,
-        endArrowhead: "arrow",
-      });
-
-      // arrow from diamond to target entity (elbowed)
-      const endPoint = getRectangleBorderCenterPoint(target, {
-        x: midX,
-        y: midY,
-      });
-      const dx2 = endPoint.x - midX;
-      const dy2 = endPoint.y - midY;
-      const points2 =
-        Math.abs(dx2) >= Math.abs(dy2)
-          ? [
-              [0, 0],
-              [dx2 * 0.6, 0],
-              [dx2 * 0.6, dy2],
-              [dx2, dy2],
-            ]
-          : [
-              [0, 0],
-              [0, dy2 * 0.6],
-              [dx2, dy2 * 0.6],
-              [dx2, dy2],
-            ];
-      skeleton.push({
-        type: "arrow",
-        x: midX,
-        y: midY,
-        points: points2,
-        roughness: 0,
-        elbowed: true,
-        straight: false,
-        endArrowhead: attribute.isForeign ? "diamond" : "arrow",
-      });
+  function getRelationshipType(
+    sourceEntity: LayoutEntity,
+    targetEntity: LayoutEntity,
+    attribute: LayoutAttribute,
+  ): string {
+    if (attribute.isPrimary && attribute.isForeign) {
+      return "";
     }
+    return "";
   }
 
-  // draw simple lines connecting each attribute oval to its entity
-  for (const entity of layout.entities) {
-    for (const attribute of entity.attributes) {
-      skeleton.push({
-        type: "line",
-        x: attribute.lineStart.x,
-        y: attribute.lineStart.y,
-        points: [
-          [0, 0],
-          [
-            attribute.lineEnd.x - attribute.lineStart.x,
-            attribute.lineEnd.y - attribute.lineStart.y,
-          ],
-        ],
-        roughness: 0,
-      });
+  function getCardinality(
+    sourceEntity: LayoutEntity,
+    targetEntity: LayoutEntity,
+    attribute: LayoutAttribute,
+  ): string {
+    if (attribute.isPrimary && attribute.isForeign) {
+      return "1-1";
     }
+    return "1-n";
   }
 
+  function getEntityCornerPoint(
+    entity: LayoutEntity,
+    targetX: number,
+    targetY: number,
+  ): Point {
+    const dx = targetX - entity.centerX;
+    const dy = targetY - entity.centerY;
+    const halfW = entity.width / 2;
+    const halfH = entity.height / 2;
+    const ratio = halfW / halfH;
+    const absDx = Math.abs(dx);
+    const absDy = Math.abs(dy);
+
+    if (absDx / absDy > ratio) {
+      return {
+        x: entity.x + (dx >= 0 ? entity.width : 0),
+        y: entity.centerY,
+      };
+    }
+    return {
+      x: entity.centerX,
+      y: entity.y + (dy >= 0 ? entity.height : 0),
+    };
+  }
+
+  function getDiamondEdgePoint(
+    diamondX: number,
+    diamondY: number,
+    targetX: number,
+    targetY: number,
+  ): Point {
+    const hw = DIAMOND_WIDTH / 2;
+    const hh = DIAMOND_HEIGHT / 2;
+    const cx = diamondX + hw;
+    const cy = diamondY + hh;
+    const dx = targetX - cx;
+    const dy = targetY - cy;
+    const absDx = Math.abs(dx);
+    const absDy = Math.abs(dy);
+
+    if (absDx * hh > absDy * hw) {
+      const t = hw / absDx;
+      return {
+        x: cx + dx * t,
+        y: cy + dy * t,
+      };
+    }
+    const t = hh / absDy;
+    return {
+      x: cx + dx * t,
+      y: cy + dy * t,
+    };
+  }
+
+  const shapes: Record<string, unknown>[] = [];
+  const arrows: Record<string, unknown>[] = [];
+
   for (const entity of layout.entities) {
-    skeleton.push({
+    shapes.push({
       id: entity.id,
       type: "rectangle",
       x: entity.x,
@@ -863,7 +837,7 @@ function buildExcalidrawSkeleton(
     });
 
     for (const attribute of entity.attributes) {
-      skeleton.push({
+      shapes.push({
         id: attribute.id,
         type: "ellipse",
         x: attribute.x - attribute.rx,
@@ -878,6 +852,125 @@ function buildExcalidrawSkeleton(
     }
   }
 
+  for (const entity of layout.entities) {
+    for (const attribute of entity.attributes) {
+      if (!attribute.references) continue;
+      const target = layout.entities.find(
+        (e) =>
+          getShortName(e.name).toLowerCase() ===
+          getShortName(attribute.references!).toLowerCase(),
+      );
+      if (!target) continue;
+      if (!attribute.isForeign) continue;
+
+      const midX = (entity.centerX + target.centerX) / 2;
+      const midY = (entity.centerY + target.centerY) / 2;
+
+      const relType = getRelationshipType(
+        entity,
+        target,
+        attribute,
+      );
+      const cardinality = getCardinality(
+        entity,
+        target,
+        attribute,
+      );
+
+      shapes.push({
+        id: `rel-${entity.id}-${target.id}`,
+        type: "diamond",
+        x: midX - DIAMOND_WIDTH / 2,
+        y: midY - DIAMOND_HEIGHT / 2,
+        width: DIAMOND_WIDTH,
+        height: DIAMOND_HEIGHT,
+        roughness: 0,
+        label: {
+          text: relType,
+        },
+      });
+
+      const entityCorner = getEntityCornerPoint(entity, midX, midY);
+      const diamondEntry = getDiamondEdgePoint(
+        midX - DIAMOND_WIDTH / 2,
+        midY - DIAMOND_HEIGHT / 2,
+        entityCorner.x,
+        entityCorner.y,
+      );
+      const dx1 = diamondEntry.x - entityCorner.x;
+      const dy1 = diamondEntry.y - entityCorner.y;
+      arrows.push({
+        type: "arrow",
+        x: entityCorner.x,
+        y: entityCorner.y,
+        points: [
+          [0, 0],
+          [dx1, dy1],
+        ],
+        roughness: 0,
+        straight: true,
+        endArrowhead: "arrow",
+        label: {
+          text: cardinality,
+        },
+      });
+
+      const targetCorner = getEntityCornerPoint(target, midX, midY);
+      const diamondExit = getDiamondEdgePoint(
+        midX - DIAMOND_WIDTH / 2,
+        midY - DIAMOND_HEIGHT / 2,
+        targetCorner.x,
+        targetCorner.y,
+      );
+      const dx2 = targetCorner.x - diamondExit.x;
+      const dy2 = targetCorner.y - diamondExit.y;
+      arrows.push({
+        type: "arrow",
+        x: diamondExit.x,
+        y: diamondExit.y,
+        points: [
+          [0, 0],
+          [dx2, dy2],
+        ],
+        roughness: 0,
+        straight: true,
+        endArrowhead: "arrow",
+        label: {
+          text: cardinality === "1-1" ? "1-1" : "n-1",
+        },
+      });
+    }
+  }
+
+  for (const entity of layout.entities) {
+    for (const attribute of entity.attributes) {
+      const dx = attribute.lineEnd.x - attribute.lineStart.x;
+      const dy = attribute.lineEnd.y - attribute.lineStart.y;
+      const length = Math.hypot(dx, dy);
+      const ux = dx / length;
+      const uy = dy / length;
+      const arrowLen = 12;
+      arrows.push({
+        type: "arrow",
+        x: attribute.lineStart.x,
+        y: attribute.lineStart.y,
+        points: [
+          [0, 0],
+          [
+            attribute.lineEnd.x - attribute.lineStart.x - ux * arrowLen,
+            attribute.lineEnd.y - attribute.lineStart.y - uy * arrowLen,
+          ],
+        ],
+        roughness: 0,
+        startArrowhead: null,
+        endArrowhead: "arrow",
+        roundArrow: false,
+      });
+    }
+  }
+
+  skeleton.push(...shapes, ...arrows);
+
   return skeleton;
 }
 
@@ -890,11 +983,7 @@ function fallbackModel(): DiagramModel {
 }
 
 export default function Home() {
-  // the raw SQL text is stored in state primarily for initial loading and hashing;
-  // the in‑page editing experience is handled by EditorJS instead of a plain textarea.
   const [schemaInput, setSchemaInput] = useState(SAMPLE_SQL);
-  const editorRef = useRef<any>(null);
-
   const [diagram, setDiagram] = useState<DiagramModel>(() => fallbackModel());
   const [errorMessage, setErrorMessage] = useState("");
   const [isSchemaOpen, setIsSchemaOpen] = useState(true);
@@ -910,56 +999,37 @@ export default function Home() {
   const initialData = useMemo(() => {
     const skeleton = buildExcalidrawSkeleton(layout);
 
-    return async () => {
-      const { convertToExcalidrawElements } =
-        await import("@excalidraw/excalidraw");
+    return () =>
+      (async () => {
+        const { convertToExcalidrawElements } =
+          await import("@excalidraw/excalidraw");
 
-      return {
-        elements: convertToExcalidrawElements(
-          skeleton as Parameters<typeof convertToExcalidrawElements>[0],
-        ),
-        appState: {
-          viewBackgroundColor: "#f8fafc",
-          theme: "light" as const,
-          currentItemRoughness: 0,
-        },
-        scrollToContent: true,
-      };
-    };
+        return {
+          elements: convertToExcalidrawElements(
+            skeleton as Parameters<typeof convertToExcalidrawElements>[0],
+          ),
+          appState: {
+            viewBackgroundColor: "#ffffff",
+            theme: "light" as const,
+            currentItemRoughness: 0,
+          },
+          scrollToContent: true,
+        };
+      })();
   }, [layout]);
 
-  // helper to read current SQL out of the editor instance
-  const getCurrentSql = async (): Promise<string> => {
-    if (editorRef.current) {
-      const saved = await editorRef.current.save();
-      const lines: string[] = [];
-      for (const b of saved.blocks) {
-        if (b.type === "code") {
-          lines.push(b.data.code);
-        } else if (b.type === "paragraph") {
-          lines.push(b.data.text);
-        }
-      }
-      return lines.join("\n");
+  const handleEditorChange = useCallback((value: string | undefined) => {
+    if (value !== undefined) {
+      setSchemaInput(value);
     }
-    return schemaInput;
-  };
+  }, []);
 
   const handleGenerate = async (): Promise<void> => {
-    let currentSql = await getCurrentSql();
+    let currentSql = schemaInput;
 
-    // run formatter to normalize SQL (client-side only)
     try {
-      currentSql = formatSql(currentSql, { language: "sql", uppercase: true });
+      currentSql = formatSql(currentSql, { language: "sql", keywordCase: "upper" });
     } catch (e) {
-      // ignore formatting errors
-    }
-
-    // reflect formatted text back into the editor
-    if (editorRef.current) {
-      await editorRef.current.render({
-        blocks: [{ type: "code", data: { code: currentSql, language: "sql" } }],
-      });
     }
 
     setSchemaInput(currentSql);
@@ -978,48 +1048,15 @@ export default function Home() {
     setErrorMessage("");
   };
 
-  // initialize EditorJS once when the component mounts
-  useEffect(() => {
-    if (editorRef.current) {
-      return;
-    }
+  const handleFileImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
 
-    // dynamic imports to avoid SSR issues
-    Promise.all([import("@editorjs/editorjs"), import("@editorjs/code")]).then(
-      ([mod, codeMod]) => {
-        const EditorJS = mod.default;
-        const CodeTool = codeMod.default;
+    const text = await file.text();
+    setSchemaInput(text);
 
-        editorRef.current = new EditorJS({
-          holder: "editorjs",
-          tools: {
-            code: {
-              class: CodeTool,
-              config: {
-                language: "sql",
-              },
-            },
-          },
-          data: {
-            blocks: [
-              {
-                type: "code",
-                data: { code: schemaInput, language: "sql" },
-              },
-            ],
-          },
-          placeholder: "Paste SQL CREATE TABLE statements here...",
-          autofocus: true,
-          initialBlock: "code",
-        });
-      },
-    );
-
-    return () => {
-      editorRef.current?.destroy();
-      editorRef.current = null;
-    };
-  }, []);
+    e.target.value = "";
+  };
 
   return (
     <main className="h-screen w-screen bg-slate-100 text-slate-900">
@@ -1045,19 +1082,42 @@ export default function Home() {
       </div>
 
       <aside
-        className={`absolute right-4 top-16 z-20 flex h-[calc(100vh-5rem)] w-[420px] flex-col gap-3 rounded-2xl border border-slate-300 bg-white/95 p-3 shadow-xl transition-transform min-h-0 ${
-          isSchemaOpen ? "translate-x-0" : "translate-x-[470px]"
+        className={`absolute right-4 top-16 z-20 flex h-[calc(100vh-5rem)] w-[520px] flex-col gap-3 rounded-2xl border border-slate-300 bg-white/95 p-4 shadow-xl transition-transform min-h-0 ${
+          isSchemaOpen ? "translate-x-0" : "translate-x-[570px]"
         }`}
       >
-        <h2 className="text-sm font-semibold">SQL Schema</h2>
-        {/* EditorJS container replaces the textarea */}
-        <div
-          id="editorjs"
-          className="flex-1 w-full rounded-xl border border-slate-300 bg-slate-50 p-3 font-mono text-xs leading-relaxed text-slate-800 whitespace-pre-wrap overflow-auto"
-        />
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold">SQL Schema</h2>
+          <label className="cursor-pointer rounded-md border border-slate-300 bg-slate-50 px-3 py-1.5 text-sm font-medium hover:bg-slate-100">
+            Import File
+            <input
+              type="file"
+              accept=".sql,.txt"
+              onChange={handleFileImport}
+              className="hidden"
+            />
+          </label>
+        </div>
+        {isSchemaOpen && (
+          <Editor
+            height="100%"
+            defaultLanguage="sql"
+            value={schemaInput}
+            onChange={handleEditorChange}
+            theme="vs-light"
+            options={{
+              minimap: { enabled: false },
+              fontSize: 13,
+              lineNumbers: "on",
+              scrollBeyondLastLine: false,
+              automaticLayout: true,
+              tabSize: 2,
+              wordWrap: "on",
+            }}
+          />
+        )}
         <p className="text-xs text-slate-600">
-          Excalidraw is now the drawing engine. After generation, you can drag
-          and edit elements freely directly on the canvas.
+          Paste SQL CREATE TABLE statements or import from file, then click Generate to create your ER diagram.
         </p>
       </aside>
 
