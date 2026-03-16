@@ -1307,82 +1307,84 @@ export default function ERDiagramPage() {
   };
 
   const PANEL_W = 440;
+  const renderToolbarPill = (className: string) => (
+    <div className={className}>
+      {/* Logo */}
+      <div className="flex h-6 w-6 items-center justify-center rounded-full bg-blue-600">
+        <svg
+          viewBox="0 0 16 16"
+          fill="none"
+          className="h-3.5 w-3.5"
+          stroke="white"
+          strokeWidth="1.8"
+        >
+          <rect x="1.5" y="3.5" width="5" height="4" rx="0.75" />
+          <rect x="9.5" y="8.5" width="5" height="4" rx="0.75" />
+          <path d="M6.5 5.5h3v5h-3" strokeLinejoin="round" />
+        </svg>
+      </div>
+
+      <span className="pr-1 text-xs font-semibold text-gray-700">SQL ERD</span>
+
+      <div className="h-4 w-px bg-gray-200" />
+
+      {/* Toggle SQL panel */}
+      <button
+        onClick={() => setPanelOpen((v) => !v)}
+        title={panelOpen ? "Hide SQL panel" : "Show SQL panel"}
+        className="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium text-gray-600 transition hover:bg-gray-100 hover:text-gray-900"
+      >
+        <svg
+          viewBox="0 0 14 10"
+          fill="none"
+          className="h-3 w-3"
+          stroke="currentColor"
+          strokeWidth="1.7"
+          strokeLinecap="round"
+        >
+          <path d="M1 1h12M1 5h7M1 9h9" />
+        </svg>
+        {panelOpen ? "Hide SQL" : "Show SQL"}
+      </button>
+
+      <div className="h-4 w-px bg-gray-200" />
+
+      {/* Generate button */}
+      <button
+        onClick={handleGenerate}
+        disabled={generating}
+        className="flex items-center gap-1.5 rounded-full bg-blue-600 px-3 py-1 text-xs font-semibold text-white transition hover:bg-blue-700 disabled:opacity-60 active:scale-95"
+      >
+        {generating ? (
+          <svg
+            className="h-3 w-3 animate-spin"
+            viewBox="0 0 12 12"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+          >
+            <circle cx="6" cy="6" r="4" strokeOpacity="0.3" />
+            <path d="M6 2a4 4 0 0 1 4 4" />
+          </svg>
+        ) : (
+          <svg
+            viewBox="0 0 10 12"
+            fill="currentColor"
+            className="h-2.5 w-2.5"
+          >
+            <polygon points="0,0 10,6 0,12" />
+          </svg>
+        )}
+        {generating ? "Generating…" : "Generate ERD"}
+      </button>
+    </div>
+  );
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-white font-sans">
-      {/* Floating pill — top-left, sits above Excalidraw's own toolbar */}
-      <div className="absolute left-1/2 top-3 z-30 -translate-x-1/2 flex items-center gap-1.5 rounded-full border border-gray-200 bg-white px-2 py-1.5 shadow-md">
-        {/* Logo */}
-        <div className="flex h-6 w-6 items-center justify-center rounded-full bg-blue-600">
-          <svg
-            viewBox="0 0 16 16"
-            fill="none"
-            className="h-3.5 w-3.5"
-            stroke="white"
-            strokeWidth="1.8"
-          >
-            <rect x="1.5" y="3.5" width="5" height="4" rx="0.75" />
-            <rect x="9.5" y="8.5" width="5" height="4" rx="0.75" />
-            <path d="M6.5 5.5h3v5h-3" strokeLinejoin="round" />
-          </svg>
-        </div>
-
-        <span className="text-xs font-semibold text-gray-700 pr-1">
-          SQL ERD
-        </span>
-
-        <div className="h-4 w-px bg-gray-200" />
-
-        {/* Toggle SQL panel */}
-        <button
-          onClick={() => setPanelOpen((v) => !v)}
-          title={panelOpen ? "Hide SQL panel" : "Show SQL panel"}
-          className="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium text-gray-600 transition hover:bg-gray-100 hover:text-gray-900"
-        >
-          <svg
-            viewBox="0 0 14 10"
-            fill="none"
-            className="h-3 w-3"
-            stroke="currentColor"
-            strokeWidth="1.7"
-            strokeLinecap="round"
-          >
-            <path d="M1 1h12M1 5h7M1 9h9" />
-          </svg>
-          {panelOpen ? "Hide SQL" : "Show SQL"}
-        </button>
-
-        <div className="h-4 w-px bg-gray-200" />
-
-        {/* Generate button */}
-        <button
-          onClick={handleGenerate}
-          disabled={generating}
-          className="flex items-center gap-1.5 rounded-full bg-blue-600 px-3 py-1 text-xs font-semibold text-white transition hover:bg-blue-700 disabled:opacity-60 active:scale-95"
-        >
-          {generating ? (
-            <svg
-              className="h-3 w-3 animate-spin"
-              viewBox="0 0 12 12"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-            >
-              <circle cx="6" cy="6" r="4" strokeOpacity="0.3" />
-              <path d="M6 2a4 4 0 0 1 4 4" />
-            </svg>
-          ) : (
-            <svg
-              viewBox="0 0 10 12"
-              fill="currentColor"
-              className="h-2.5 w-2.5"
-            >
-              <polygon points="0,0 10,6 0,12" />
-            </svg>
-          )}
-          {generating ? "Generating…" : "Generate ERD"}
-        </button>
-      </div>
+      {renderToolbarPill(
+        "absolute left-1/2 top-3 z-30 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-gray-200 bg-white px-2 py-1.5 shadow-md md:hidden",
+      )}
 
       {/* - Body - */}
       <div className="relative h-full w-full">
@@ -1394,6 +1396,13 @@ export default function ERDiagramPage() {
           <Excalidraw
             key={excalidrawKey}
             initialData={initialData}
+            renderTopRightUI={(isMobile) =>
+              isMobile
+                ? null
+                : renderToolbarPill(
+                    "pointer-events-auto flex items-center gap-1.5 rounded-full border border-gray-200 bg-white px-2 py-1.5 shadow-md",
+                  )
+            }
             excalidrawAPI={(api: any) => {
               excalidrawApiRef.current = api;
             }}
