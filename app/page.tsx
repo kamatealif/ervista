@@ -740,8 +740,8 @@ function buildExcalidrawSkeleton(
 ): Record<string, unknown>[] {
   const skeleton: Record<string, unknown>[] = [];
 
-  const DIAMOND_WIDTH = 100;
-  const DIAMOND_HEIGHT = 30;
+  const DIAMOND_MIN_WIDTH = 130;
+  const DIAMOND_MIN_HEIGHT = 44;
   const DEFAULT_FONT_SIZE = 16;
 
   function getRelationshipType(
@@ -805,11 +805,13 @@ function buildExcalidrawSkeleton(
   function getDiamondEdgePoint(
     diamondX: number,
     diamondY: number,
+    diamondWidth: number,
+    diamondHeight: number,
     targetX: number,
     targetY: number,
   ): Point {
-    const hw = DIAMOND_WIDTH / 2;
-    const hh = DIAMOND_HEIGHT / 2;
+    const hw = diamondWidth / 2;
+    const hh = diamondHeight / 2;
     const cx = diamondX + hw;
     const cy = diamondY + hh;
     const dx = targetX - cx;
@@ -829,6 +831,47 @@ function buildExcalidrawSkeleton(
       x: cx + dx * t,
       y: cy + dy * t,
     };
+  }
+
+  function clamp(value: number, min: number, max: number) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function rectsOverlap(
+    a: { x: number; y: number; w: number; h: number },
+    b: { x: number; y: number; w: number; h: number },
+  ) {
+    return (
+      a.x < b.x + b.w &&
+      a.x + a.w > b.x &&
+      a.y < b.y + b.h &&
+      a.y + a.h > b.y
+    );
+  }
+
+  function routeElbowPoints(
+    start: Point,
+    end: Point,
+    bias: "h" | "v",
+  ): [number, number][] {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+
+    if (bias === "h") {
+      const midX = clamp(dx, -9000, 9000);
+      return [
+        [0, 0],
+        [midX, 0],
+        [midX, clamp(dy, -9000, 9000)],
+      ];
+    }
+
+    const midY = clamp(dy, -9000, 9000);
+    return [
+      [0, 0],
+      [0, midY],
+      [clamp(dx, -9000, 9000), midY],
+    ];
   }
 
   const shapes: Record<string, unknown>[] = [];
@@ -947,33 +990,83 @@ function buildExcalidrawSkeleton(
         attribute,
       );
 
-      const midX = (entity.centerX + target.centerX) / 2;
-      const midY = (entity.centerY + target.centerY) / 2;
+      const baseMidX = (entity.centerX + target.centerX) / 2;
+      const baseMidY = (entity.centerY + target.centerY) / 2;
+
+      const diamondText = relType || "rel";
+      const diamondWidth = Math.max(
+        DIAMOND_MIN_WIDTH,
+        Math.ceil(diamondText.length * 10 + 56),
+      );
+      const diamondHeight = DIAMOND_MIN_HEIGHT;
+
+      // try to move the diamond away from attribute ovals if it overlaps
+      const dirX = target.centerX - entity.centerX;
+      const dirY = target.centerY - entity.centerY;
+      const len = Math.max(1, Math.hypot(dirX, dirY));
+      // perpendicular unit vector
+      const px = -dirY / len;
+      const py = dirX / len;
+
+      let midX = baseMidX;
+      let midY = baseMidY;
+      const diamondPad = 18;
+      const diamondBox = () => ({
+        x: midX - diamondWidth / 2 - diamondPad,
+        y: midY - diamondHeight / 2 - diamondPad,
+        w: diamondWidth + diamondPad * 2,
+        h: diamondHeight + diamondPad * 2,
+      });
+
+      const attributeBoxes = layout.entities.flatMap((e) =>
+        e.attributes.map((attr) => ({
+          x: attr.x - attr.rx - 10,
+          y: attr.y - attr.ry - 10,
+          w: attr.rx * 2 + 20,
+          h: attr.ry * 2 + 20,
+        })),
+      );
+
+      for (let step = 0; step < 10; step += 1) {
+        const current = diamondBox();
+        const overlapsAny = attributeBoxes.some((box) =>
+          rectsOverlap(current, box),
+        );
+        if (!overlapsAny) break;
+
+        const magnitude = 26 + step * 18;
+        const direction = step % 2 === 0 ? 1 : -1;
+        midX = baseMidX + px * magnitude * direction;
+        midY = baseMidY + py * magnitude * direction;
+      }
 
       shapes.push({
         id: `rel-${entity.id}-${target.id}`,
         type: "diamond",
-        x: midX - DIAMOND_WIDTH / 2,
-        y: midY - DIAMOND_HEIGHT / 2,
-        width: DIAMOND_WIDTH,
-        height: DIAMOND_HEIGHT,
+        x: midX - diamondWidth / 2,
+        y: midY - diamondHeight / 2,
+        width: diamondWidth,
+        height: diamondHeight,
         roughness: 0,
       });
       if (relType) {
         pushText({
           id: `rel-${entity.id}-${target.id}-text`,
-          x: midX - (DIAMOND_WIDTH / 2) + 10,
-          y: midY - 10,
+          x: midX,
+          y: midY,
           text: relType,
           fontSize: 14,
-          width: DIAMOND_WIDTH - 20,
+          width: diamondWidth - 20,
+          center: true,
         });
       }
 
       const entityCorner = getEntityCornerPoint(entity, midX, midY);
       const diamondEntry = getDiamondEdgePoint(
-        midX - DIAMOND_WIDTH / 2,
-        midY - DIAMOND_HEIGHT / 2,
+        midX - diamondWidth / 2,
+        midY - diamondHeight / 2,
+        diamondWidth,
+        diamondHeight,
         entityCorner.x,
         entityCorner.y,
       );
@@ -982,12 +1075,16 @@ function buildExcalidrawSkeleton(
         type: "arrow",
         x: entityCorner.x,
         y: entityCorner.y,
-        points: [
-          [0, 0],
-          [diamondEntry.x - entityCorner.x, diamondEntry.y - entityCorner.y],
-        ],
+        points: routeElbowPoints(
+          entityCorner,
+          diamondEntry,
+          Math.abs(diamondEntry.x - entityCorner.x) >=
+            Math.abs(diamondEntry.y - entityCorner.y)
+            ? "h"
+            : "v",
+        ),
         roughness: 0,
-        straight: true,
+        straight: false,
         startArrowhead: null,
         endArrowhead: null,
       });
@@ -1001,8 +1098,10 @@ function buildExcalidrawSkeleton(
 
       const targetCorner = getEntityCornerPoint(target, midX, midY);
       const diamondExit = getDiamondEdgePoint(
-        midX - DIAMOND_WIDTH / 2,
-        midY - DIAMOND_HEIGHT / 2,
+        midX - diamondWidth / 2,
+        midY - diamondHeight / 2,
+        diamondWidth,
+        diamondHeight,
         targetCorner.x,
         targetCorner.y,
       );
@@ -1011,12 +1110,16 @@ function buildExcalidrawSkeleton(
         type: "arrow",
         x: diamondExit.x,
         y: diamondExit.y,
-        points: [
-          [0, 0],
-          [targetCorner.x - diamondExit.x, targetCorner.y - diamondExit.y],
-        ],
+        points: routeElbowPoints(
+          diamondExit,
+          targetCorner,
+          Math.abs(targetCorner.x - diamondExit.x) >=
+            Math.abs(targetCorner.y - diamondExit.y)
+            ? "h"
+            : "v",
+        ),
         roughness: 0,
-        straight: true,
+        straight: false,
         startArrowhead: null,
         endArrowhead: null,
       });
