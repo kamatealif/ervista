@@ -1,16 +1,16 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useMemo, useState, useCallback, useRef } from "react";
-import { format as formatSql } from "sql-formatter";
-import Editor from "@monaco-editor/react";
+import { useMemo, useState, useCallback, useRef, useEffect } from "react";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 type DiagramAttribute = {
   name: string;
   type: string;
   isPrimary: boolean;
   isForeign: boolean;
-  references?: string; // normalized table name if this column references another table
+  references?: string;
 };
 
 type DiagramEntity = {
@@ -22,10 +22,234 @@ type DiagramModel = {
   entities: DiagramEntity[];
 };
 
-type Point = {
-  x: number;
-  y: number;
-};
+// ─── SQL Parser ───────────────────────────────────────────────────────────────
+
+function stripIdentifierQuotes(value: string): string {
+  const t = value.trim();
+  if (!t) return t;
+  if (
+    (t.startsWith('"') && t.endsWith('"')) ||
+    (t.startsWith("`") && t.endsWith("`")) ||
+    (t.startsWith("'") && t.endsWith("'"))
+  ) {
+    return t.slice(1, -1).trim();
+  }
+  if (t.startsWith("[") && t.endsWith("]")) return t.slice(1, -1).trim();
+  return t;
+}
+
+function normalizeIdentifier(raw: string): string {
+  return raw
+    .split(".")
+    .map((p) => stripIdentifierQuotes(p))
+    .filter(Boolean)
+    .join(".");
+}
+
+function getShortName(tableName: string): string {
+  const parts = tableName.split(".");
+  return parts[parts.length - 1] ?? tableName;
+}
+
+function removeSqlComments(sql: string): string {
+  return sql.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--.*$/gm, " ");
+}
+
+function splitTopLevelComma(input: string): string[] {
+  const chunks: string[] = [];
+  let start = 0,
+    depth = 0;
+  let quote: "'" | '"' | "`" | "]" | null = null;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (quote) {
+      if (quote === "]") {
+        if (ch === "]") quote = null;
+        continue;
+      }
+      if (ch === quote) {
+        if (quote === "'" && input[i + 1] === "'") {
+          i++;
+        } else quote = null;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "[") {
+      quote = "]";
+      continue;
+    }
+    if (ch === "(") {
+      depth++;
+      continue;
+    }
+    if (ch === ")") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (ch === "," && depth === 0) {
+      const s = input.slice(start, i).trim();
+      if (s) chunks.push(s);
+      start = i + 1;
+    }
+  }
+  const trail = input.slice(start).trim();
+  if (trail) chunks.push(trail);
+  return chunks;
+}
+
+function extractCreateTableBlocks(
+  sql: string,
+): Array<{ tableName: string; body: string }> {
+  const cleaned = removeSqlComments(sql);
+  const blocks: Array<{ tableName: string; body: string }> = [];
+  const re = /create\s+table\s+(?:if\s+not\s+exists\s+)?/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(cleaned)) !== null) {
+    let cursor = re.lastIndex;
+    while (cursor < cleaned.length && /\s/.test(cleaned[cursor] ?? ""))
+      cursor++;
+    const nameStart = cursor;
+    while (cursor < cleaned.length && cleaned[cursor] !== "(") cursor++;
+    if (cursor >= cleaned.length) break;
+    const rawName = cleaned.slice(nameStart, cursor).trim();
+    const bodyStart = cursor + 1;
+    let depth = 0,
+      closeIdx = -1;
+    let q: "'" | '"' | "`" | "]" | null = null;
+    for (cursor = bodyStart; cursor < cleaned.length; cursor++) {
+      const ch = cleaned[cursor];
+      if (q) {
+        if (q === "]") {
+          if (ch === "]") q = null;
+          continue;
+        }
+        if (ch === q) {
+          if (q === "'" && cleaned[cursor + 1] === "'") cursor++;
+          else q = null;
+        }
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === "`") {
+        q = ch;
+        continue;
+      }
+      if (ch === "[") {
+        q = "]";
+        continue;
+      }
+      if (ch === "(") {
+        depth++;
+        continue;
+      }
+      if (ch === ")") {
+        if (depth === 0) {
+          closeIdx = cursor;
+          break;
+        }
+        depth--;
+      }
+    }
+    if (closeIdx === -1) break;
+    blocks.push({
+      tableName: normalizeIdentifier(rawName),
+      body: cleaned.slice(bodyStart, closeIdx),
+    });
+    re.lastIndex = closeIdx + 1;
+  }
+  return blocks;
+}
+
+function parseSqlSchema(sql: string): DiagramModel {
+  const blocks = extractCreateTableBlocks(sql);
+  if (!blocks.length) return { entities: [] };
+  const entities: DiagramEntity[] = [];
+  for (const block of blocks) {
+    const sections = splitTopLevelComma(block.body);
+    const attributes: DiagramAttribute[] = [];
+    const pkCols = new Set<string>();
+    const fkCols = new Set<string>();
+    const fkRefs: Record<string, string> = {};
+
+    for (let rawSec of sections) {
+      let section = rawSec.trim();
+      if (!section) continue;
+      if (/^constraint\b/i.test(section))
+        section = section.replace(
+          /^constraint\s+(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[^\s]+)\s+/i,
+          "",
+        );
+
+      const pkMatch = section.match(/^primary\s+key\s*\(([^)]+)\)/i);
+      if (pkMatch) {
+        splitTopLevelComma(pkMatch[1])
+          .map((c) => normalizeIdentifier(c))
+          .forEach((c) => pkCols.add(c.toLowerCase()));
+        continue;
+      }
+      const fkMatch = section.match(
+        /^foreign\s+key\s*\(([^)]+)\)\s*references\s+([^\s(]+)\s*\(([^)]+)\)/i,
+      );
+      if (fkMatch) {
+        const ref = normalizeIdentifier(fkMatch[2]);
+        splitTopLevelComma(fkMatch[1])
+          .map((c) => normalizeIdentifier(c))
+          .forEach((c) => {
+            const k = c.toLowerCase();
+            fkCols.add(k);
+            fkRefs[k] = ref;
+          });
+        continue;
+      }
+      const colMatch = section.match(
+        /^("([^"]+)"|`([^`]+)`|\[[^\]]+\]|[^\s]+)\s+([\s\S]+)$/i,
+      );
+      if (!colMatch) continue;
+      const colName = normalizeIdentifier(colMatch[1]);
+      const definition = colMatch[4].trim();
+      const kIdx = definition.search(
+        /\s+(?:not\s+null|null|primary\s+key|references|unique|check|default|constraint|generated|collate|identity|auto_increment)\b/i,
+      );
+      const type = (
+        kIdx === -1 ? definition : definition.slice(0, kIdx)
+      ).trim();
+      const extras = kIdx === -1 ? "" : definition.slice(kIdx).trim();
+      const isPrimary = /\bprimary\s+key\b/i.test(extras);
+      const isForeign = /\breferences\b/i.test(extras);
+      let references: string | undefined;
+      const refMatch = extras.match(/references\s+([^\s(]+)/i);
+      if (refMatch) references = normalizeIdentifier(refMatch[1]);
+      attributes.push({
+        name: colName,
+        type,
+        isPrimary,
+        isForeign,
+        references,
+      });
+    }
+
+    entities.push({
+      name: block.tableName,
+      attributes: attributes.map((attr) => {
+        const k = attr.name.toLowerCase();
+        return {
+          ...attr,
+          isPrimary: attr.isPrimary || pkCols.has(k),
+          isForeign: attr.isForeign || fkCols.has(k),
+          references: attr.references || fkRefs[k],
+        };
+      }),
+    });
+  }
+  return { entities };
+}
+
+// ─── Layout Engine ────────────────────────────────────────────────────────────
+
+type Point = { x: number; y: number };
 
 type LayoutAttribute = {
   id: string;
@@ -48,8 +272,8 @@ type LayoutEntity = {
   y: number;
   width: number;
   height: number;
-  centerX: number;
-  centerY: number;
+  cx: number;
+  cy: number;
   attributes: LayoutAttribute[];
 };
 
@@ -59,10 +283,548 @@ type DiagramLayout = {
   entities: LayoutEntity[];
 };
 
-const Excalidraw = dynamic(
-  () => import("@excalidraw/excalidraw").then((module) => module.Excalidraw),
-  { ssr: false },
-);
+function rectEdgePoint(entity: LayoutEntity, target: Point): Point {
+  const dx = target.x - entity.cx;
+  const dy = target.y - entity.cy;
+  if (Math.abs(dx) * entity.height >= Math.abs(dy) * entity.width) {
+    return {
+      x: entity.x + (dx >= 0 ? entity.width : 0),
+      y: entity.cy + (dy * (entity.width / 2)) / Math.max(1, Math.abs(dx)),
+    };
+  }
+  return {
+    x: entity.cx + (dx * (entity.height / 2)) / Math.max(1, Math.abs(dy)),
+    y: entity.y + (dy >= 0 ? entity.height : 0),
+  };
+}
+
+function ellipseEdgePoint(
+  cx: number,
+  cy: number,
+  rx: number,
+  ry: number,
+  target: Point,
+): Point {
+  const dx = target.x - cx;
+  const dy = target.y - cy;
+  const len = Math.hypot(dx, dy) || 1;
+  const ux = dx / len,
+    uy = dy / len;
+  const scale = 1 / Math.sqrt((ux * ux) / (rx * rx) + (uy * uy) / (ry * ry));
+  return { x: cx + ux * scale, y: cy + uy * scale };
+}
+
+function buildLayout(model: DiagramModel): DiagramLayout {
+  if (!model.entities.length) return { width: 1600, height: 900, entities: [] };
+
+  const ENT_W = 200,
+    ENT_H = 70;
+  const ATT_RX = 72,
+    ATT_RY = 26;
+  const ORBIT_R = 160;
+  const PAD = 280;
+  const CELL_W = (ORBIT_R + ATT_RX) * 2 + 120;
+  const CELL_H = (ORBIT_R + ATT_RY) * 2 + 120;
+
+  const cols = Math.max(1, Math.ceil(Math.sqrt(model.entities.length)));
+  const rows = Math.ceil(model.entities.length / cols);
+
+  const canvasW = Math.max(1600, cols * CELL_W + PAD * 2);
+  const canvasH = Math.max(900, rows * CELL_H + PAD * 2);
+
+  const entities: LayoutEntity[] = model.entities.map((ent, i) => {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const cx = PAD + col * CELL_W + CELL_W / 2;
+    const cy = PAD + row * CELL_H + CELL_H / 2;
+    const x = cx - ENT_W / 2;
+    const y = cy - ENT_H / 2;
+
+    const entity: LayoutEntity = {
+      id: `ent-${ent.name.toLowerCase().replace(/\W+/g, "_")}`,
+      name: getShortName(ent.name),
+      x,
+      y,
+      width: ENT_W,
+      height: ENT_H,
+      cx,
+      cy,
+      attributes: [],
+    };
+
+    const count = ent.attributes.length;
+    ent.attributes.forEach((attr, j) => {
+      // distribute attributes evenly around the entity
+      const angle =
+        count === 1 ? -Math.PI / 2 : -Math.PI / 2 + (2 * Math.PI * j) / count;
+
+      const orbitX = ORBIT_R + ATT_RX * 0.4;
+      const orbitY = ORBIT_R + ATT_RY * 0.4;
+
+      const ax = cx + orbitX * Math.cos(angle);
+      const ay = cy + orbitY * Math.sin(angle);
+
+      const lineStart = rectEdgePoint(entity, { x: ax, y: ay });
+      const lineEnd = ellipseEdgePoint(ax, ay, ATT_RX, ATT_RY, lineStart);
+
+      const label =
+        attr.name + (attr.isPrimary ? " (PK)" : attr.isForeign ? " (FK)" : "");
+
+      entity.attributes.push({
+        id: `${entity.id}-attr-${attr.name.toLowerCase().replace(/\W+/g, "_")}`,
+        x: ax,
+        y: ay,
+        rx: ATT_RX,
+        ry: ATT_RY,
+        label,
+        lineStart,
+        lineEnd,
+        isPrimary: attr.isPrimary,
+        isForeign: attr.isForeign,
+        references: attr.references,
+      });
+    });
+
+    return entity;
+  });
+
+  return { width: canvasW, height: canvasH, entities };
+}
+
+// ─── Excalidraw Element Builder ───────────────────────────────────────────────
+
+type ExElement = Record<string, unknown>;
+
+let _eid = 1;
+function eid() {
+  return `el-${_eid++}-${Math.random().toString(36).slice(2)}`;
+}
+
+function makeRect(
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  extra: Record<string, unknown> = {},
+): ExElement {
+  return {
+    id: eid(),
+    type: "rectangle",
+    x,
+    y,
+    width: w,
+    height: h,
+    angle: 0,
+    opacity: 100,
+    strokeColor: "#1e293b",
+    backgroundColor: "#dbeafe",
+    fillStyle: "solid",
+    strokeWidth: 2,
+    strokeStyle: "solid",
+    roughness: 0,
+    roundness: { type: 3, value: 6 },
+    isDeleted: false,
+    frameId: null,
+    link: null,
+    locked: false,
+    groupIds: [],
+    seed: Math.floor(Math.random() * 999999),
+    version: 1,
+    versionNonce: 1,
+    ...extra,
+  };
+}
+
+function makeEllipse(
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  extra: Record<string, unknown> = {},
+): ExElement {
+  return {
+    id: eid(),
+    type: "ellipse",
+    x,
+    y,
+    width: w,
+    height: h,
+    angle: 0,
+    opacity: 100,
+    strokeColor: "#1e293b",
+    backgroundColor: "#f0fdf4",
+    fillStyle: "solid",
+    strokeWidth: 1.5,
+    strokeStyle: "solid",
+    roughness: 0,
+    roundness: { type: 2 },
+    isDeleted: false,
+    frameId: null,
+    link: null,
+    locked: false,
+    groupIds: [],
+    seed: Math.floor(Math.random() * 999999),
+    version: 1,
+    versionNonce: 1,
+    ...extra,
+  };
+}
+
+function makeDiamond(
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  extra: Record<string, unknown> = {},
+): ExElement {
+  return {
+    id: eid(),
+    type: "diamond",
+    x,
+    y,
+    width: w,
+    height: h,
+    angle: 0,
+    opacity: 100,
+    strokeColor: "#1e293b",
+    backgroundColor: "#fef9c3",
+    fillStyle: "solid",
+    strokeWidth: 1.5,
+    strokeStyle: "solid",
+    roughness: 0,
+    roundness: null,
+    isDeleted: false,
+    frameId: null,
+    link: null,
+    locked: false,
+    groupIds: [],
+    seed: Math.floor(Math.random() * 999999),
+    version: 1,
+    versionNonce: 1,
+    ...extra,
+  };
+}
+
+function makeText(
+  x: number,
+  y: number,
+  text: string,
+  fontSize = 14,
+  bold = false,
+  extra: Record<string, unknown> = {},
+): ExElement {
+  const approxW = text.length * fontSize * 0.6 + 16;
+  const approxH = fontSize * 1.4;
+  return {
+    id: eid(),
+    type: "text",
+    x: x - approxW / 2,
+    y: y - approxH / 2,
+    width: approxW,
+    height: approxH,
+    angle: 0,
+    opacity: 100,
+    strokeColor: "#0f172a",
+    backgroundColor: "transparent",
+    fillStyle: "solid",
+    strokeWidth: 1,
+    strokeStyle: "solid",
+    roughness: 0,
+    roundness: null,
+    isDeleted: false,
+    frameId: null,
+    link: null,
+    locked: false,
+    groupIds: [],
+    seed: Math.floor(Math.random() * 999999),
+    version: 1,
+    versionNonce: 1,
+    text,
+    fontSize,
+    fontFamily: 3, // monospace
+    textAlign: "center",
+    verticalAlign: "middle",
+    baseline: Math.floor(fontSize * 0.9),
+    containerId: null,
+    originalText: text,
+    lineHeight: 1.25,
+    autoResize: true,
+    fontStyle: bold ? "bold" : "normal",
+    ...extra,
+  };
+}
+
+function makeLine(
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  extra: Record<string, unknown> = {},
+): ExElement {
+  return {
+    id: eid(),
+    type: "line",
+    x: x1,
+    y: y1,
+    width: Math.abs(x2 - x1),
+    height: Math.abs(y2 - y1),
+    angle: 0,
+    opacity: 100,
+    strokeColor: "#334155",
+    backgroundColor: "transparent",
+    fillStyle: "solid",
+    strokeWidth: 1.5,
+    strokeStyle: "solid",
+    roughness: 0,
+    roundness: null,
+    isDeleted: false,
+    frameId: null,
+    link: null,
+    locked: false,
+    groupIds: [],
+    seed: Math.floor(Math.random() * 999999),
+    version: 1,
+    versionNonce: 1,
+    points: [
+      [0, 0],
+      [x2 - x1, y2 - y1],
+    ],
+    lastCommittedPoint: null,
+    startBinding: null,
+    endBinding: null,
+    startArrowhead: null,
+    endArrowhead: null,
+    ...extra,
+  };
+}
+
+function makeArrow(
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  label?: string,
+  extra: Record<string, unknown> = {},
+): ExElement {
+  return {
+    id: eid(),
+    type: "arrow",
+    x: x1,
+    y: y1,
+    width: Math.abs(x2 - x1),
+    height: Math.abs(y2 - y1),
+    angle: 0,
+    opacity: 100,
+    strokeColor: "#475569",
+    backgroundColor: "transparent",
+    fillStyle: "solid",
+    strokeWidth: 1.5,
+    strokeStyle: "solid",
+    roughness: 0,
+    roundness: { type: 2 },
+    isDeleted: false,
+    frameId: null,
+    link: null,
+    locked: false,
+    groupIds: [],
+    seed: Math.floor(Math.random() * 999999),
+    version: 1,
+    versionNonce: 1,
+    points: [
+      [0, 0],
+      [x2 - x1, y2 - y1],
+    ],
+    lastCommittedPoint: null,
+    startBinding: null,
+    endBinding: null,
+    startArrowhead: null,
+    endArrowhead: null,
+    ...extra,
+  };
+}
+
+function buildElements(layout: DiagramLayout): ExElement[] {
+  const elements: ExElement[] = [];
+
+  // Draw entity-attribute lines, ellipses, entity rectangles
+  for (const ent of layout.entities) {
+    // Entity rectangle
+    elements.push(
+      makeRect(ent.x, ent.y, ent.width, ent.height, {
+        strokeColor: "#1e40af",
+        backgroundColor: "#bfdbfe",
+        strokeWidth: 2,
+      }),
+    );
+    elements.push(
+      makeText(ent.cx, ent.cy, ent.name, 16, true, {
+        strokeColor: "#1e3a8a",
+      }),
+    );
+
+    // Attributes
+    for (const attr of ent.attributes) {
+      // Line from entity to attribute
+      elements.push(
+        makeLine(
+          attr.lineStart.x,
+          attr.lineStart.y,
+          attr.lineEnd.x,
+          attr.lineEnd.y,
+          { strokeColor: "#64748b", strokeWidth: 1.5 },
+        ),
+      );
+
+      // Ellipse: double ellipse for PK (draw two)
+      const bgColor = attr.isPrimary
+        ? "#fef3c7"
+        : attr.isForeign
+          ? "#dcfce7"
+          : "#f8fafc";
+      const strokeColor = attr.isPrimary
+        ? "#92400e"
+        : attr.isForeign
+          ? "#14532d"
+          : "#334155";
+      elements.push(
+        makeEllipse(
+          attr.x - attr.rx,
+          attr.y - attr.ry,
+          attr.rx * 2,
+          attr.ry * 2,
+          {
+            backgroundColor: bgColor,
+            strokeColor,
+            strokeWidth: attr.isPrimary ? 2 : 1.5,
+          },
+        ),
+      );
+      // Double ellipse border for PK
+      if (attr.isPrimary) {
+        const inset = 4;
+        elements.push(
+          makeEllipse(
+            attr.x - attr.rx + inset,
+            attr.y - attr.ry + inset,
+            (attr.rx - inset) * 2,
+            (attr.ry - inset) * 2,
+            {
+              backgroundColor: "transparent",
+              strokeColor: "#92400e",
+              strokeWidth: 1,
+            },
+          ),
+        );
+      }
+
+      // Attribute label (underline for PK shown via bold)
+      elements.push(
+        makeText(attr.x, attr.y, attr.label, 12, attr.isPrimary, {
+          strokeColor: attr.isPrimary
+            ? "#78350f"
+            : attr.isForeign
+              ? "#14532d"
+              : "#1e293b",
+        }),
+      );
+    }
+  }
+
+  // Draw relationships (FK → referenced table) with diamond
+  for (const ent of layout.entities) {
+    for (const attr of ent.attributes) {
+      if (!attr.isForeign || !attr.references) continue;
+
+      const targetEnt = layout.entities.find(
+        (e) =>
+          getShortName(e.name).toLowerCase() ===
+          getShortName(attr.references!).toLowerCase(),
+      );
+      if (!targetEnt) continue;
+
+      // Place diamond between the two entity centers
+      const mx = (ent.cx + targetEnt.cx) / 2;
+      const my = (ent.cy + targetEnt.cy) / 2;
+      const DW = 110,
+        DH = 54;
+      const dx = mx - DW / 2;
+      const dy = my - DH / 2;
+      const dcx = mx,
+        dcy = my;
+
+      elements.push(
+        makeDiamond(dx, dy, DW, DH, {
+          strokeColor: "#713f12",
+          backgroundColor: "#fef9c3",
+          strokeWidth: 1.5,
+        }),
+      );
+      elements.push(
+        makeText(dcx, dcy, "has", 12, false, {
+          strokeColor: "#713f12",
+        }),
+      );
+
+      // Diamond edge points
+      function diamondEdge(tx: number, ty: number): Point {
+        const ddx = tx - dcx,
+          ddy = ty - dcy;
+        const hw = DW / 2,
+          hh = DH / 2;
+        const adx = Math.abs(ddx),
+          ady = Math.abs(ddy);
+        if (adx * hh > ady * hw) {
+          const t = hw / adx;
+          return { x: dcx + ddx * t, y: dcy + ddy * t };
+        }
+        const t = hh / Math.max(ady, 0.001);
+        return { x: dcx + ddx * t, y: dcy + ddy * t };
+      }
+
+      // Source entity → diamond
+      const srcPt = rectEdgePoint(ent, { x: dcx, y: dcy });
+      const dEntry = diamondEdge(srcPt.x, srcPt.y);
+      elements.push(
+        makeLine(srcPt.x, srcPt.y, dEntry.x, dEntry.y, {
+          strokeColor: "#475569",
+          strokeWidth: 1.5,
+        }),
+      );
+      // Cardinality labels
+      elements.push(
+        makeText(
+          (srcPt.x + dEntry.x) / 2,
+          (srcPt.y + dEntry.y) / 2 - 12,
+          "1",
+          11,
+        ),
+      );
+
+      // Diamond → target entity
+      const tgtPt = rectEdgePoint(targetEnt, { x: dcx, y: dcy });
+      const dExit = diamondEdge(tgtPt.x, tgtPt.y);
+      elements.push(
+        makeLine(dExit.x, dExit.y, tgtPt.x, tgtPt.y, {
+          strokeColor: "#475569",
+          strokeWidth: 1.5,
+          endArrowhead: "arrow",
+        }),
+      );
+      elements.push(
+        makeText(
+          (tgtPt.x + dExit.x) / 2,
+          (tgtPt.y + dExit.y) / 2 - 12,
+          "N",
+          11,
+        ),
+      );
+    }
+  }
+
+  return elements;
+}
+
+// ─── Sample SQL ───────────────────────────────────────────────────────────────
 
 const SAMPLE_SQL = `CREATE TABLE users (
   id INT PRIMARY KEY,
@@ -85,1346 +847,370 @@ CREATE TABLE order_items (
   product_name VARCHAR(120) NOT NULL,
   quantity INT NOT NULL,
   unit_price DECIMAL(10,2) NOT NULL,
-  CONSTRAINT fk_order_items_order FOREIGN KEY (order_id) REFERENCES orders(id)
+  CONSTRAINT fk_order FOREIGN KEY (order_id) REFERENCES orders(id)
 );`;
 
-function stripIdentifierQuotes(value: string): string {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return trimmed;
-  }
-
-  if (
-    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-    (trimmed.startsWith("`") && trimmed.endsWith("`")) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
-    return trimmed.slice(1, -1).trim();
-  }
-
-  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-    return trimmed.slice(1, -1).trim();
-  }
-
-  return trimmed;
-}
-
-function normalizeIdentifier(raw: string): string {
-  return raw
-    .split(".")
-    .map((part) => stripIdentifierQuotes(part))
-    .filter(Boolean)
-    .join(".");
-}
-
-function getShortName(tableName: string): string {
-  const parts = tableName.split(".");
-  return parts[parts.length - 1] ?? tableName;
-}
-
-function removeSqlComments(sql: string): string {
-  return sql.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--.*$/gm, " ");
-}
-
-function splitTopLevelComma(input: string): string[] {
-  const chunks: string[] = [];
-  let start = 0;
-  let depth = 0;
-  let quote: "'" | '"' | "`" | "]" | null = null;
-
-  for (let index = 0; index < input.length; index += 1) {
-    const char = input[index];
-
-    if (quote) {
-      if (quote === "]") {
-        if (char === "]") {
-          quote = null;
-        }
-        continue;
-      }
-
-      if (char === quote) {
-        if (quote === "'" && input[index + 1] === "'") {
-          index += 1;
-        } else {
-          quote = null;
-        }
-      }
-      continue;
-    }
-
-    if (char === "'" || char === '"' || char === "`") {
-      quote = char;
-      continue;
-    }
-
-    if (char === "[") {
-      quote = "]";
-      continue;
-    }
-
-    if (char === "(") {
-      depth += 1;
-      continue;
-    }
-
-    if (char === ")") {
-      depth = Math.max(0, depth - 1);
-      continue;
-    }
-
-    if (char === "," && depth === 0) {
-      const section = input.slice(start, index).trim();
-      if (section) {
-        chunks.push(section);
-      }
-      start = index + 1;
-    }
-  }
-
-  const trailing = input.slice(start).trim();
-  if (trailing) {
-    chunks.push(trailing);
-  }
-
-  return chunks;
-}
-
-function parseIdentifierList(input: string): string[] {
-  return splitTopLevelComma(input).map((part) => normalizeIdentifier(part));
-}
-
-function extractCreateTableBlocks(
-  sql: string,
-): Array<{ tableName: string; body: string }> {
-  const cleaned = removeSqlComments(sql);
-  const blocks: Array<{ tableName: string; body: string }> = [];
-  const createTableRegex = /create\s+table\s+(?:if\s+not\s+exists\s+)?/gi;
-
-  while (createTableRegex.exec(cleaned) !== null) {
-    let cursor = createTableRegex.lastIndex;
-
-    while (cursor < cleaned.length && /\s/.test(cleaned[cursor] ?? "")) {
-      cursor += 1;
-    }
-
-    const tableNameStart = cursor;
-    while (cursor < cleaned.length && cleaned[cursor] !== "(") {
-      cursor += 1;
-    }
-
-    if (cursor >= cleaned.length) {
-      break;
-    }
-
-    const rawTableName = cleaned.slice(tableNameStart, cursor).trim();
-    const bodyStart = cursor + 1;
-    let depth = 0;
-    let closingIndex = -1;
-    let quote: "'" | '"' | "`" | "]" | null = null;
-
-    for (cursor = bodyStart; cursor < cleaned.length; cursor += 1) {
-      const char = cleaned[cursor];
-
-      if (quote) {
-        if (quote === "]") {
-          if (char === "]") {
-            quote = null;
-          }
-          continue;
-        }
-
-        if (char === quote) {
-          if (quote === "'" && cleaned[cursor + 1] === "'") {
-            cursor += 1;
-          } else {
-            quote = null;
-          }
-        }
-        continue;
-      }
-
-      if (char === "'" || char === '"' || char === "`") {
-        quote = char;
-        continue;
-      }
-
-      if (char === "[") {
-        quote = "]";
-        continue;
-      }
-
-      if (char === "(") {
-        depth += 1;
-        continue;
-      }
-
-      if (char === ")") {
-        if (depth === 0) {
-          closingIndex = cursor;
-          break;
-        }
-        depth -= 1;
-      }
-    }
-
-    if (closingIndex === -1) {
-      break;
-    }
-
-    blocks.push({
-      tableName: normalizeIdentifier(rawTableName),
-      body: cleaned.slice(bodyStart, closingIndex),
-    });
-
-    createTableRegex.lastIndex = closingIndex + 1;
-  }
-
-  return blocks;
-}
-
-function parseSqlSchema(sql: string): DiagramModel {
-  const blocks = extractCreateTableBlocks(sql);
-  if (blocks.length === 0) {
-    return { entities: [] };
-  }
-
-  const entities: DiagramEntity[] = [];
-
-  for (const block of blocks) {
-    const sections = splitTopLevelComma(block.body);
-    const attributes: DiagramAttribute[] = [];
-    const primaryKeyColumns = new Set<string>();
-    const foreignKeyColumns = new Set<string>();
-    const foreignRefs: Record<string, string> = {};
-
-    for (const originalSection of sections) {
-      let section = originalSection.trim();
-      if (!section) {
-        continue;
-      }
-
-      if (/^constraint\b/i.test(section)) {
-        section = section.replace(
-          /^constraint\s+(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[^\s]+)\s+/i,
-          "",
-        );
-      }
-
-      const primaryMatch = section.match(/^primary\s+key\s*\(([^)]+)\)/i);
-      if (primaryMatch) {
-        parseIdentifierList(primaryMatch[1]).forEach((column) =>
-          primaryKeyColumns.add(column.toLowerCase()),
-        );
-        continue;
-      }
-
-      const foreignMatch = section.match(
-        /^foreign\s+key\s*\(([^)]+)\)\s*references\s+([^\s(]+)\s*\(([^)]+)\)/i,
-      );
-      if (foreignMatch) {
-        const referenced = normalizeIdentifier(foreignMatch[2]);
-        parseIdentifierList(foreignMatch[1]).forEach((column) => {
-          const key = column.toLowerCase();
-          foreignKeyColumns.add(key);
-          foreignRefs[key] = referenced;
-        });
-        continue;
-      }
-
-      const columnMatch = section.match(
-        /^("([^"]+)"|`([^`]+)`|\[[^\]]+\]|[^\s]+)\s+([\s\S]+)$/i,
-      );
-      if (!columnMatch) {
-        continue;
-      }
-
-      const columnName = normalizeIdentifier(columnMatch[1]);
-      const definition = columnMatch[4].trim();
-      const keywordIndex = definition.search(
-        /\s+(?:not\s+null|null|primary\s+key|references|unique|check|default|constraint|generated|collate|identity|auto_increment)\b/i,
-      );
-      const type = (
-        keywordIndex === -1 ? definition : definition.slice(0, keywordIndex)
-      ).trim();
-      const extras =
-        keywordIndex === -1 ? "" : definition.slice(keywordIndex).trim();
-
-      const isPrimary = /\bprimary\s+key\b/i.test(extras);
-      const isForeign = /\breferences\b/i.test(extras);
-
-      if (isPrimary) {
-        primaryKeyColumns.add(columnName.toLowerCase());
-      }
-      if (isForeign) {
-        foreignKeyColumns.add(columnName.toLowerCase());
-      }
-
-      // check extras for explicit references to extract target table
-      let references: string | undefined;
-      const refMatch = extras.match(/references\s+([^\s(]+)/i);
-      if (refMatch) {
-        references = normalizeIdentifier(refMatch[1]);
-      }
-
-      attributes.push({
-        name: columnName,
-        type,
-        isPrimary,
-        isForeign,
-        references,
-      });
-    }
-
-    entities.push({
-      name: block.tableName,
-      attributes: attributes.map((attribute) => {
-        const key = attribute.name.toLowerCase();
-        return {
-          ...attribute,
-          isPrimary: attribute.isPrimary || primaryKeyColumns.has(key),
-          isForeign: attribute.isForeign || foreignKeyColumns.has(key),
-          references: attribute.references || foreignRefs[key],
-        };
-      }),
-    });
-  }
-
-  return { entities };
-}
-
-function hashTextToSeed(value: string): number {
-  let hash = 2166136261;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return hash >>> 0 || 1;
-}
-
-function createRuntimeSeed(): number {
-  return (Date.now() ^ Math.floor(Math.random() * 0xffffffff)) >>> 0 || 1;
-}
-
-function createSeededRandom(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
-    return state / 4294967296;
-  };
-}
-
-function shuffleArray<T>(items: T[], random: () => number): T[] {
-  const output = [...items];
-  for (let index = output.length - 1; index > 0; index -= 1) {
-    const swapIndex = Math.floor(random() * (index + 1));
-    const current = output[index];
-    output[index] = output[swapIndex];
-    output[swapIndex] = current;
-  }
-  return output;
-}
-
-function getRectangleBorderCenterPoint(
-  rectangle: Pick<
-    LayoutEntity,
-    "x" | "y" | "width" | "height" | "centerX" | "centerY"
-  >,
-  target: Point,
-): Point {
-  const dx = target.x - rectangle.centerX;
-  const dy = target.y - rectangle.centerY;
-
-  if (Math.abs(dx) >= Math.abs(dy)) {
-    return {
-      x: dx >= 0 ? rectangle.x + rectangle.width : rectangle.x,
-      y: rectangle.centerY,
-    };
-  }
-
-  return {
-    x: rectangle.centerX,
-    y: dy >= 0 ? rectangle.y + rectangle.height : rectangle.y,
-  };
-}
-
-function buildDiagramLayout(
-  model: DiagramModel,
-  randomSeed: number,
-): DiagramLayout {
-  if (model.entities.length === 0) {
-    return { width: 1800, height: 1000, entities: [] };
-  }
-
-  const ENTITY_WIDTH = 236;
-  const ENTITY_HEIGHT = 92;
-  const ATTRIBUTE_RX = 68;
-  const ATTRIBUTE_RY = 40;
-  const ATTRIBUTE_EDGE_GAP = 96;
-  const ATTRIBUTE_RING_PADDING = 36;
-  const ATTRIBUTE_MIN_ARC_GAP = 18;
-  const CANVAS_PADDING = 220;
-  const CONTENT_MARGIN = 220;
-  // extra space between cells to avoid attributes of adjacent entities overlapping
-  const CELL_GAP = 160;
-
-  const baseOrbitX = ENTITY_WIDTH / 2 + ATTRIBUTE_EDGE_GAP + ATTRIBUTE_RX;
-  const baseOrbitY = ENTITY_HEIGHT / 2 + ATTRIBUTE_EDGE_GAP + ATTRIBUTE_RY;
-  const averageOrbit = (baseOrbitX + baseOrbitY) / 2;
-
-  const entityMetrics = model.entities.map((entity) => {
-    const attributeCount = entity.attributes.length;
-    const neededCircumference =
-      attributeCount * (ATTRIBUTE_RX * 2 + ATTRIBUTE_MIN_ARC_GAP);
-    const orbitScale =
-      attributeCount === 0
-        ? 1
-        : Math.max(
-            1,
-            neededCircumference / Math.max(1, 2 * Math.PI * averageOrbit),
-          );
-
-    const orbitX = baseOrbitX * orbitScale;
-    const orbitY = baseOrbitY * orbitScale;
-    const halfWidth = orbitX + ATTRIBUTE_RX + ATTRIBUTE_RING_PADDING;
-    const halfHeight = orbitY + ATTRIBUTE_RY + ATTRIBUTE_RING_PADDING;
-
-    return {
-      entity,
-      orbitX,
-      orbitY,
-      halfWidth,
-      halfHeight,
-    };
-  });
-
-  const maxHalfWidth = Math.max(
-    ...entityMetrics.map((metric) => metric.halfWidth),
+// ─── Excalidraw Dynamic Import ────────────────────────────────────────────────
+
+const Excalidraw = dynamic(
+  () => import("@excalidraw/excalidraw").then((m) => m.Excalidraw),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex items-center justify-center h-full text-slate-400">
+        Loading canvas…
+      </div>
+    ),
+  },
+);
+
+// ─── Main Component ───────────────────────────────────────────────────────────
+
+export default function ERDiagramPage() {
+  const [sql, setSql] = useState(SAMPLE_SQL);
+  const [model, setModel] = useState<DiagramModel>(() =>
+    parseSqlSchema(SAMPLE_SQL),
   );
-  const maxHalfHeight = Math.max(
-    ...entityMetrics.map((metric) => metric.halfHeight),
-  );
-
-  const cellWidth = maxHalfWidth * 2 + 90 + CELL_GAP;
-  const cellHeight = maxHalfHeight * 2 + 90 + CELL_GAP;
-
-  const cols = Math.max(1, Math.ceil(Math.sqrt(entityMetrics.length)));
-  const rows = Math.ceil(entityMetrics.length / cols);
-
-  const width = Math.ceil(CANVAS_PADDING * 2 + cols * cellWidth);
-  const height = Math.ceil(CANVAS_PADDING * 2 + rows * cellHeight);
-
-  const random = createSeededRandom(
-    hashTextToSeed(`${randomSeed}:${entityMetrics.length}`),
-  );
-
-  const minCenterX = CANVAS_PADDING + maxHalfWidth;
-  const maxCenterX = width - CANVAS_PADDING - maxHalfWidth;
-  const minCenterY = CANVAS_PADDING + maxHalfHeight;
-  const maxCenterY = height - CANVAS_PADDING - maxHalfHeight;
-
-  const slotCenters: Point[] = [];
-  for (let row = 0; row < rows; row += 1) {
-    for (let col = 0; col < cols; col += 1) {
-      slotCenters.push({
-        x: CANVAS_PADDING + col * cellWidth + cellWidth / 2,
-        y: CANVAS_PADDING + row * cellHeight + cellHeight / 2,
-      });
-    }
-  }
-  const shuffledSlots = shuffleArray(slotCenters, random);
-
-  const placedCenters: Array<
-    Point & { halfWidth: number; halfHeight: number }
-  > = [];
-
-  const positionedEntities: LayoutEntity[] = entityMetrics.map(
-    (metric, index) => {
-      let centerX =
-        minCenterX + random() * Math.max(1, maxCenterX - minCenterX);
-      let centerY =
-        minCenterY + random() * Math.max(1, maxCenterY - minCenterY);
-      let placed = false;
-
-      for (let attempt = 0; attempt < 300; attempt += 1) {
-        const overlaps = placedCenters.some((center) => {
-          const dx = Math.abs(centerX - center.x);
-          const dy = Math.abs(centerY - center.y);
-          return (
-            dx < center.halfWidth + metric.halfWidth + 24 &&
-            dy < center.halfHeight + metric.halfHeight + 24
-          );
-        });
-
-        if (!overlaps) {
-          placed = true;
-          break;
-        }
-
-        if (attempt < 180) {
-          centerX =
-            minCenterX + random() * Math.max(1, maxCenterX - minCenterX);
-          centerY =
-            minCenterY + random() * Math.max(1, maxCenterY - minCenterY);
-        } else {
-          const slot = shuffledSlots[index % shuffledSlots.length] ?? {
-            x: width / 2,
-            y: height / 2,
-          };
-          centerX = slot.x;
-          centerY = slot.y;
-        }
-      }
-
-      if (!placed) {
-        const slot = shuffledSlots[index % shuffledSlots.length] ?? {
-          x: width / 2,
-          y: height / 2,
-        };
-        centerX = slot.x;
-        centerY = slot.y;
-      }
-
-      placedCenters.push({
-        x: centerX,
-        y: centerY,
-        halfWidth: metric.halfWidth,
-        halfHeight: metric.halfHeight,
-      });
-
-      const entityX = centerX - ENTITY_WIDTH / 2;
-      const entityY = centerY - ENTITY_HEIGHT / 2;
-
-      const entity: LayoutEntity = {
-        id: `entity-${metric.entity.name.toLowerCase()}`,
-        name: getShortName(metric.entity.name),
-        x: entityX,
-        y: entityY,
-        width: ENTITY_WIDTH,
-        height: ENTITY_HEIGHT,
-        centerX,
-        centerY,
-        attributes: [],
-      };
-
-      const count = metric.entity.attributes.length;
-      if (count > 0) {
-        for (
-          let attributeIndex = 0;
-          attributeIndex < count;
-          attributeIndex += 1
-        ) {
-          const attribute = metric.entity.attributes[attributeIndex];
-          const angle =
-            count === 1
-              ? -Math.PI / 2
-              : -Math.PI / 2 + (2 * Math.PI * attributeIndex) / count;
-
-          const x = centerX + metric.orbitX * Math.cos(angle);
-          const y = centerY + metric.orbitY * Math.sin(angle);
-
-          const lineStart = getRectangleBorderCenterPoint(entity, { x, y });
-          const dx = x - lineStart.x;
-          const dy = y - lineStart.y;
-          const length = Math.max(1, Math.hypot(dx, dy));
-          const ux = (lineStart.x - x) / length;
-          const uy = (lineStart.y - y) / length;
-          const ellipseScale =
-            1 /
-            Math.sqrt(
-              (ux * ux) / (ATTRIBUTE_RX * ATTRIBUTE_RX) +
-                (uy * uy) / (ATTRIBUTE_RY * ATTRIBUTE_RY),
-            );
-          const lineEnd = {
-            x: x + ux * ellipseScale,
-            y: y + uy * ellipseScale,
-          };
-
-          const suffix = `${attribute.isPrimary ? "*" : ""}${attribute.isForeign ? " fk" : ""}`;
-          entity.attributes.push({
-            id: `${entity.id}-attr-${attribute.name.toLowerCase()}`,
-            x,
-            y,
-            rx: ATTRIBUTE_RX,
-            ry: ATTRIBUTE_RY,
-            label: `${attribute.name}${suffix ? ` ${suffix}` : ""}`,
-            lineStart,
-            lineEnd,
-            isPrimary: attribute.isPrimary,
-            isForeign: attribute.isForeign,
-            references: attribute.references,
-          });
-        }
-      }
-
-      return entity;
-    },
-  );
-
-  let minX = Number.POSITIVE_INFINITY;
-  let minY = Number.POSITIVE_INFINITY;
-  let maxX = Number.NEGATIVE_INFINITY;
-  let maxY = Number.NEGATIVE_INFINITY;
-
-  for (const entity of positionedEntities) {
-    minX = Math.min(minX, entity.x - 16);
-    minY = Math.min(minY, entity.y - 16);
-    maxX = Math.max(maxX, entity.x + entity.width + 16);
-    maxY = Math.max(maxY, entity.y + entity.height + 16);
-
-    for (const attribute of entity.attributes) {
-      minX = Math.min(
-        minX,
-        attribute.x - attribute.rx - 12,
-        attribute.lineStart.x,
-        attribute.lineEnd.x,
-      );
-      maxX = Math.max(
-        maxX,
-        attribute.x + attribute.rx + 12,
-        attribute.lineStart.x,
-        attribute.lineEnd.x,
-      );
-      minY = Math.min(
-        minY,
-        attribute.y - attribute.ry - 12,
-        attribute.lineStart.y,
-        attribute.lineEnd.y,
-      );
-      maxY = Math.max(
-        maxY,
-        attribute.y + attribute.ry + 12,
-        attribute.lineStart.y,
-        attribute.lineEnd.y,
-      );
-    }
-  }
-
-  if (
-    Number.isFinite(minX) &&
-    Number.isFinite(minY) &&
-    Number.isFinite(maxX) &&
-    Number.isFinite(maxY)
-  ) {
-    const shiftX = CONTENT_MARGIN - minX;
-    const shiftY = CONTENT_MARGIN - minY;
-
-    for (const entity of positionedEntities) {
-      entity.x += shiftX;
-      entity.y += shiftY;
-      entity.centerX += shiftX;
-      entity.centerY += shiftY;
-
-      for (const attribute of entity.attributes) {
-        attribute.x += shiftX;
-        attribute.y += shiftY;
-        attribute.lineStart.x += shiftX;
-        attribute.lineStart.y += shiftY;
-        attribute.lineEnd.x += shiftX;
-        attribute.lineEnd.y += shiftY;
-      }
-    }
-
-    return {
-      width: Math.max(1800, Math.ceil(maxX - minX + CONTENT_MARGIN * 2)),
-      height: Math.max(1000, Math.ceil(maxY - minY + CONTENT_MARGIN * 2)),
-      entities: positionedEntities,
-    };
-  }
-
-  return { width, height, entities: positionedEntities };
-}
-
-function buildExcalidrawSkeleton(
-  layout: DiagramLayout,
-): Record<string, unknown>[] {
-  const skeleton: Record<string, unknown>[] = [];
-
-  const DIAMOND_MIN_WIDTH = 130;
-  const DIAMOND_MIN_HEIGHT = 44;
-  const DEFAULT_FONT_SIZE = 16;
-
-  function getRelationshipType(
-    sourceEntity: LayoutEntity,
-    targetEntity: LayoutEntity,
-    attribute: LayoutAttribute,
-  ): string {
-    if (attribute.isPrimary && attribute.isForeign) {
-      return "";
-    }
-    return "has";
-  }
-
-  function getCardinality(
-    sourceEntity: LayoutEntity,
-    targetEntity: LayoutEntity,
-    attribute: LayoutAttribute,
-  ): string {
-    if (attribute.isPrimary && attribute.isForeign) {
-      return "1-1";
-    }
-    return "1-n";
-  }
-
-  function getCardinalityTarget(
-    sourceEntity: LayoutEntity,
-    targetEntity: LayoutEntity,
-    attribute: LayoutAttribute,
-  ): string {
-    if (attribute.isPrimary && attribute.isForeign) {
-      return "1-1";
-    }
-    return "n-1";
-  }
-
-  function getEntityCornerPoint(
-    entity: LayoutEntity,
-    targetX: number,
-    targetY: number,
-  ): Point {
-    const dx = targetX - entity.centerX;
-    const dy = targetY - entity.centerY;
-    const halfW = entity.width / 2;
-    const halfH = entity.height / 2;
-    const ratio = halfW / halfH;
-    const absDx = Math.abs(dx);
-    const absDy = Math.abs(dy);
-
-    if (absDx / absDy > ratio) {
-      return {
-        x: entity.x + (dx >= 0 ? entity.width : 0),
-        y: entity.centerY,
-      };
-    }
-    return {
-      x: entity.centerX,
-      y: entity.y + (dy >= 0 ? entity.height : 0),
-    };
-  }
-
-  function getDiamondEdgePoint(
-    diamondX: number,
-    diamondY: number,
-    diamondWidth: number,
-    diamondHeight: number,
-    targetX: number,
-    targetY: number,
-  ): Point {
-    const hw = diamondWidth / 2;
-    const hh = diamondHeight / 2;
-    const cx = diamondX + hw;
-    const cy = diamondY + hh;
-    const dx = targetX - cx;
-    const dy = targetY - cy;
-    const absDx = Math.abs(dx);
-    const absDy = Math.abs(dy);
-
-    if (absDx * hh > absDy * hw) {
-      const t = hw / absDx;
-      return {
-        x: cx + dx * t,
-        y: cy + dy * t,
-      };
-    }
-    const t = hh / absDy;
-    return {
-      x: cx + dx * t,
-      y: cy + dy * t,
-    };
-  }
-
-  function clamp(value: number, min: number, max: number) {
-    return Math.max(min, Math.min(max, value));
-  }
-
-  function rectsOverlap(
-    a: { x: number; y: number; w: number; h: number },
-    b: { x: number; y: number; w: number; h: number },
-  ) {
-    return (
-      a.x < b.x + b.w &&
-      a.x + a.w > b.x &&
-      a.y < b.y + b.h &&
-      a.y + a.h > b.y
-    );
-  }
-
-  function routeElbowPoints(
-    start: Point,
-    end: Point,
-    bias: "h" | "v",
-  ): [number, number][] {
-    const dx = end.x - start.x;
-    const dy = end.y - start.y;
-
-    if (bias === "h") {
-      const midX = clamp(dx, -9000, 9000);
-      return [
-        [0, 0],
-        [midX, 0],
-        [midX, clamp(dy, -9000, 9000)],
-      ];
-    }
-
-    const midY = clamp(dy, -9000, 9000);
-    return [
-      [0, 0],
-      [0, midY],
-      [clamp(dx, -9000, 9000), midY],
-    ];
-  }
-
-  const shapes: Record<string, unknown>[] = [];
-  const arrows: Record<string, unknown>[] = [];
-  const texts: Record<string, unknown>[] = [];
-
-  function pushText(params: {
-    id: string;
-    x: number;
-    y: number;
-    text: string;
-    fontSize?: number;
-    width?: number;
-    center?: boolean;
-  }) {
-    const fontSize = params.fontSize ?? DEFAULT_FONT_SIZE;
-    const approxCharWidth = fontSize * 0.62;
-    const approxWidth = Math.max(
-      12,
-      params.width ?? Math.ceil(params.text.length * approxCharWidth),
-    );
-    const approxHeight = Math.max(14, Math.ceil(fontSize * 1.35));
-    const x = params.center ? params.x - approxWidth / 2 : params.x;
-    const y = params.center ? params.y - approxHeight / 2 : params.y;
-
-    texts.push({
-      id: params.id,
-      type: "text",
-      x,
-      y,
-      text: params.text,
-      fontSize,
-      width: approxWidth,
-      height: approxHeight,
-      roughness: 0,
-    });
-  }
-
-  for (const entity of layout.entities) {
-    shapes.push({
-      id: entity.id,
-      type: "rectangle",
-      x: entity.x,
-      y: entity.y,
-      width: entity.width,
-      height: entity.height,
-      roughness: 0,
-    });
-    pushText({
-      id: `${entity.id}-text`,
-      x: entity.centerX,
-      y: entity.centerY,
-      text: entity.name,
-      fontSize: 18,
-      width: entity.width - 24,
-      center: true,
-    });
-
-    for (const attribute of entity.attributes) {
-      shapes.push({
-        id: attribute.id,
-        type: "ellipse",
-        x: attribute.x - attribute.rx,
-        y: attribute.y - attribute.ry,
-        width: attribute.rx * 2,
-        height: attribute.ry * 2,
-        roughness: 0,
-      });
-      pushText({
-        id: `${attribute.id}-text`,
-        x: attribute.x,
-        y: attribute.y,
-        text: attribute.label,
-        fontSize: 14,
-        width: attribute.rx * 2 - 20,
-        center: true,
-      });
-
-      if (attribute.isPrimary) {
-        const labelWidth = attribute.label.length * 7;
-        shapes.push({
-          id: `${attribute.id}-underline`,
-          type: "line",
-          x: attribute.x - labelWidth / 2,
-          y: attribute.y + attribute.ry - 2,
-          points: [
-            [0, 0],
-            [labelWidth, 0],
-          ],
-          roughness: 0,
-          strokeStyle: "solid",
-        });
-      }
-    }
-  }
-
-  for (const entity of layout.entities) {
-    for (const attribute of entity.attributes) {
-      if (!attribute.references) continue;
-      const target = layout.entities.find(
-        (e) =>
-          getShortName(e.name).toLowerCase() ===
-          getShortName(attribute.references!).toLowerCase(),
-      );
-      if (!target) continue;
-      if (!attribute.isForeign) continue;
-
-      const relType = getRelationshipType(
-        entity,
-        target,
-        attribute,
-      );
-      const cardinality = getCardinality(
-        entity,
-        target,
-        attribute,
-      );
-
-      const baseMidX = (entity.centerX + target.centerX) / 2;
-      const baseMidY = (entity.centerY + target.centerY) / 2;
-
-      const diamondText = relType || "rel";
-      const diamondWidth = Math.max(
-        DIAMOND_MIN_WIDTH,
-        Math.ceil(diamondText.length * 10 + 56),
-      );
-      const diamondHeight = DIAMOND_MIN_HEIGHT;
-
-      // try to move the diamond away from attribute ovals if it overlaps
-      const dirX = target.centerX - entity.centerX;
-      const dirY = target.centerY - entity.centerY;
-      const len = Math.max(1, Math.hypot(dirX, dirY));
-      // perpendicular unit vector
-      const px = -dirY / len;
-      const py = dirX / len;
-
-      let midX = baseMidX;
-      let midY = baseMidY;
-      const diamondPad = 18;
-      const diamondBox = () => ({
-        x: midX - diamondWidth / 2 - diamondPad,
-        y: midY - diamondHeight / 2 - diamondPad,
-        w: diamondWidth + diamondPad * 2,
-        h: diamondHeight + diamondPad * 2,
-      });
-
-      const attributeBoxes = layout.entities.flatMap((e) =>
-        e.attributes.map((attr) => ({
-          x: attr.x - attr.rx - 10,
-          y: attr.y - attr.ry - 10,
-          w: attr.rx * 2 + 20,
-          h: attr.ry * 2 + 20,
-        })),
-      );
-
-      for (let step = 0; step < 10; step += 1) {
-        const current = diamondBox();
-        const overlapsAny = attributeBoxes.some((box) =>
-          rectsOverlap(current, box),
-        );
-        if (!overlapsAny) break;
-
-        const magnitude = 26 + step * 18;
-        const direction = step % 2 === 0 ? 1 : -1;
-        midX = baseMidX + px * magnitude * direction;
-        midY = baseMidY + py * magnitude * direction;
-      }
-
-      shapes.push({
-        id: `rel-${entity.id}-${target.id}`,
-        type: "diamond",
-        x: midX - diamondWidth / 2,
-        y: midY - diamondHeight / 2,
-        width: diamondWidth,
-        height: diamondHeight,
-        roughness: 0,
-      });
-      if (relType) {
-        pushText({
-          id: `rel-${entity.id}-${target.id}-text`,
-          x: midX,
-          y: midY,
-          text: relType,
-          fontSize: 14,
-          width: diamondWidth - 20,
-          center: true,
-        });
-      }
-
-      const entityCorner = getEntityCornerPoint(entity, midX, midY);
-      const diamondEntry = getDiamondEdgePoint(
-        midX - diamondWidth / 2,
-        midY - diamondHeight / 2,
-        diamondWidth,
-        diamondHeight,
-        entityCorner.x,
-        entityCorner.y,
-      );
-      
-      arrows.push({
-        type: "arrow",
-        x: entityCorner.x,
-        y: entityCorner.y,
-        points: routeElbowPoints(
-          entityCorner,
-          diamondEntry,
-          Math.abs(diamondEntry.x - entityCorner.x) >=
-            Math.abs(diamondEntry.y - entityCorner.y)
-            ? "h"
-            : "v",
-        ),
-        roughness: 0,
-        straight: false,
-        startArrowhead: null,
-        endArrowhead: null,
-      });
-      pushText({
-        id: `rel-${entity.id}-${target.id}-card-a`,
-        x: (entityCorner.x + diamondEntry.x) / 2 - 10,
-        y: (entityCorner.y + diamondEntry.y) / 2 - 10,
-        text: cardinality,
-        fontSize: 12,
-      });
-
-      const targetCorner = getEntityCornerPoint(target, midX, midY);
-      const diamondExit = getDiamondEdgePoint(
-        midX - diamondWidth / 2,
-        midY - diamondHeight / 2,
-        diamondWidth,
-        diamondHeight,
-        targetCorner.x,
-        targetCorner.y,
-      );
-
-      arrows.push({
-        type: "arrow",
-        x: diamondExit.x,
-        y: diamondExit.y,
-        points: routeElbowPoints(
-          diamondExit,
-          targetCorner,
-          Math.abs(targetCorner.x - diamondExit.x) >=
-            Math.abs(targetCorner.y - diamondExit.y)
-            ? "h"
-            : "v",
-        ),
-        roughness: 0,
-        straight: false,
-        startArrowhead: null,
-        endArrowhead: null,
-      });
-      pushText({
-        id: `rel-${entity.id}-${target.id}-card-b`,
-        x: (targetCorner.x + diamondExit.x) / 2 - 10,
-        y: (targetCorner.y + diamondExit.y) / 2 - 10,
-        text: getCardinalityTarget(entity, target, attribute),
-        fontSize: 12,
-      });
-    }
-  }
-
-  for (const entity of layout.entities) {
-    for (const attribute of entity.attributes) {
-      const dx = attribute.lineEnd.x - attribute.lineStart.x;
-      const dy = attribute.lineEnd.y - attribute.lineStart.y;
-      const length = Math.hypot(dx, dy);
-      const ux = dx / length;
-      const uy = dy / length;
-      const arrowLen = 12;
-      arrows.push({
-        type: "arrow",
-        x: attribute.lineStart.x,
-        y: attribute.lineStart.y,
-        points: [
-          [0, 0],
-          [
-            attribute.lineEnd.x - attribute.lineStart.x - ux * arrowLen,
-            attribute.lineEnd.y - attribute.lineStart.y - uy * arrowLen,
-          ],
-        ],
-        roughness: 0,
-        startArrowhead: null,
-        endArrowhead: "arrow",
-        roundArrow: false,
-      });
-    }
-  }
-
-  skeleton.push(...shapes, ...texts, ...arrows);
-
-  return skeleton;
-}
-
-function fallbackModel(): DiagramModel {
-  try {
-    return parseSqlSchema(SAMPLE_SQL);
-  } catch {
-    return { entities: [] };
-  }
-}
-
-export default function Home() {
-  const [schemaInput, setSchemaInput] = useState(SAMPLE_SQL);
-  const [diagram, setDiagram] = useState<DiagramModel>(() => fallbackModel());
-  const [errorMessage, setErrorMessage] = useState("");
-  const [isSchemaOpen, setIsSchemaOpen] = useState(true);
-  const [layoutSeed, setLayoutSeed] = useState(() =>
-    hashTextToSeed(SAMPLE_SQL),
-  );
-
-  const layout = useMemo(
-    () => buildDiagramLayout(diagram, layoutSeed),
-    [diagram, layoutSeed],
-  );
+  const [error, setError] = useState("");
+  const [panelOpen, setPanelOpen] = useState(true);
+  const [key, setKey] = useState(0);
+  const excalidrawApiRef = useRef<any>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const layout = useMemo(() => buildLayout(model), [model]);
 
   const initialData = useMemo(() => {
-    const skeleton = buildExcalidrawSkeleton(layout);
-
-    return () =>
-      (async () => {
-        const { convertToExcalidrawElements } =
-          await import("@excalidraw/excalidraw");
-
-        return {
-          elements: convertToExcalidrawElements(
-            skeleton as Parameters<typeof convertToExcalidrawElements>[0],
-          ),
-          appState: {
-            viewBackgroundColor: "#ffffff",
-            theme: "light" as const,
-            currentItemRoughness: 0,
-          },
-          scrollToContent: true,
-        };
-      })();
-  }, [layout]);
-
-  const handleEditorChange = useCallback((value: string | undefined) => {
-    if (value !== undefined) {
-      setSchemaInput(value);
-    }
-  }, []);
-
-  const handleGenerate = async (): Promise<void> => {
-    let currentSql = schemaInput;
-
-    try {
-      currentSql = formatSql(currentSql, { language: "sql", keywordCase: "upper" });
-    } catch {
-    }
-
-    setSchemaInput(currentSql);
-
-    const parsed = parseSqlSchema(currentSql);
-    if (parsed.entities.length === 0) {
-      setErrorMessage(
-        "No CREATE TABLE statements were found. Paste a SQL schema and try again.",
-      );
-      setDiagram({ entities: [] });
-      return;
-    }
-
-    setDiagram(parsed);
-    setLayoutSeed(createRuntimeSeed());
-    setErrorMessage("");
-  };
-
-  const handleFileImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const text = await file.text();
-    setSchemaInput(text);
-
-    e.target.value = "";
-  };
-
-  type ExcalidrawApiSnapshot = {
-    getSceneElements: () => unknown[];
-    getAppState: () => Record<string, unknown>;
-  };
-
-  const excalidrawApiRef = useRef<ExcalidrawApiSnapshot | null>(null);
-
-  const downloadBlob = (blob: Blob, filename: string) => {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  };
-
-  const getExportSnapshot = () => {
-    if (!excalidrawApiRef.current) return;
-    const elements = excalidrawApiRef.current.getSceneElements();
-    const appState = excalidrawApiRef.current.getAppState();
+    const elements = buildElements(layout);
     return {
       elements,
       appState: {
-        ...appState,
+        viewBackgroundColor: "#f8fafc",
+        theme: "light" as const,
+        currentItemRoughness: 0,
+        zoom: { value: 0.8 },
+        scrollX: 0,
+        scrollY: 0,
+      },
+      scrollToContent: true,
+    };
+  }, [layout]);
+
+  const handleGenerate = () => {
+    try {
+      const parsed = parseSqlSchema(sql);
+      if (!parsed.entities.length) {
+        setError("No CREATE TABLE statements found. Please check your SQL.");
+        return;
+      }
+      setModel(parsed);
+      setKey((k) => k + 1);
+      setError("");
+    } catch (e: any) {
+      setError("Parse error: " + e.message);
+    }
+  };
+
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const text = await file.text();
+    setSql(text);
+    e.target.value = "";
+  };
+
+  const getSnapshot = () => {
+    const api = excalidrawApiRef.current;
+    if (!api) return null;
+    return {
+      elements: api.getSceneElements(),
+      appState: {
+        ...api.getAppState(),
         exportWithDarkMode: false,
-        viewBackgroundColor: "#ffffff",
+        viewBackgroundColor: "#f8fafc",
       },
     };
   };
 
-  const handleExportPng = async () => {
-    const snapshot = getExportSnapshot();
-    if (!snapshot) return;
-
-    const { exportToBlob } = await import("@excalidraw/excalidraw");
-    const blob = await exportToBlob({
-      elements: snapshot.elements,
-      appState: snapshot.appState,
-      format: "png",
-      exportPadding: 24,
-      exportBackground: true,
-    });
-
-    downloadBlob(blob, "erd-diagram.png");
+  const exportAs = async (format: "png" | "jpg" | "svg") => {
+    const snap = getSnapshot();
+    if (!snap) return;
+    const mod = await import("@excalidraw/excalidraw");
+    if (format === "svg") {
+      const svg = await mod.exportToSvg({
+        ...snap,
+        exportPadding: 32,
+        exportBackground: true,
+      });
+      const blob = new Blob([new XMLSerializer().serializeToString(svg)], {
+        type: "image/svg+xml",
+      });
+      download(blob, "erd.svg");
+    } else {
+      const blob = await mod.exportToBlob({
+        ...snap,
+        format,
+        exportPadding: 32,
+        exportBackground: true,
+      });
+      download(blob, `erd.${format}`);
+    }
   };
 
-  const handleExportJpg = async () => {
-    const snapshot = getExportSnapshot();
-    if (!snapshot) return;
-
-    const { exportToBlob } = await import("@excalidraw/excalidraw");
-    const blob = await exportToBlob({
-      elements: snapshot.elements,
-      appState: snapshot.appState,
-      format: "jpg",
-      exportPadding: 24,
-      exportBackground: true,
-    });
-
-    downloadBlob(blob, "erd-diagram.jpg");
-  };
-
-  const handleExportSvg = async () => {
-    const snapshot = getExportSnapshot();
-    if (!snapshot) return;
-
-    const { exportToSvg } = await import("@excalidraw/excalidraw");
-    const svg = await exportToSvg({
-      elements: snapshot.elements,
-      appState: snapshot.appState,
-      exportPadding: 24,
-      exportBackground: true,
-    });
-
-    const serialized = new XMLSerializer().serializeToString(svg);
-    const blob = new Blob([serialized], { type: "image/svg+xml;charset=utf-8" });
-    downloadBlob(blob, "erd-diagram.svg");
+  const download = (blob: Blob, name: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   return (
-    <main className="h-screen w-screen bg-slate-100 text-slate-900">
-      <div className="absolute left-4 top-4 z-20 flex items-center gap-2 rounded-xl border border-slate-300 bg-white/95 px-3 py-2 shadow-sm">
-        <h1 className="text-sm font-semibold">SQL ERD (Excalidraw)</h1>
+    <main
+      style={{
+        height: "100vh",
+        width: "100vw",
+        background: "#f1f5f9",
+        fontFamily: "system-ui, sans-serif",
+        overflow: "hidden",
+        position: "relative",
+      }}
+    >
+      {/* Top-left title */}
+      <div
+        style={{
+          position: "absolute",
+          top: 12,
+          left: 12,
+          zIndex: 30,
+          background: "white",
+          border: "1px solid #cbd5e1",
+          borderRadius: 10,
+          padding: "6px 14px",
+          boxShadow: "0 1px 4px rgba(0,0,0,0.08)",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+        }}
+      >
+        <span style={{ fontSize: 13, fontWeight: 700, color: "#0f172a" }}>
+          ⬡ SQL ER Diagram
+        </span>
       </div>
 
-      <div className="absolute right-4 top-4 z-20 flex items-center gap-2 rounded-xl border border-slate-300 bg-white/95 p-2 shadow-sm backdrop-blur">
+      {/* Top-right toolbar */}
+      <div
+        style={{
+          position: "absolute",
+          top: 12,
+          right: 12,
+          zIndex: 30,
+          background: "white",
+          border: "1px solid #cbd5e1",
+          borderRadius: 10,
+          padding: "6px 10px",
+          boxShadow: "0 1px 4px rgba(0,0,0,0.08)",
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+        }}
+      >
         <button
-          type="button"
-          onClick={() => setIsSchemaOpen((value) => !value)}
-          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+          onClick={() => setPanelOpen((v) => !v)}
+          style={btnStyle("#f8fafc", "#334155")}
         >
-          {isSchemaOpen ? "Hide SQL" : "Show SQL"}
+          {panelOpen ? "← Hide SQL" : "Show SQL →"}
         </button>
         <button
-          type="button"
-          onClick={() => void handleGenerate()}
-          className="rounded-md border border-blue-700 bg-blue-700 px-3 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-blue-800 focus:outline-none focus:ring-2 focus:ring-blue-500/40"
+          onClick={handleGenerate}
+          style={btnStyle("#1d4ed8", "white", true)}
         >
-          Generate
+          ⚡ Generate
         </button>
-        <div className="mx-1 h-6 w-px bg-slate-200" />
+        <div style={{ width: 1, height: 22, background: "#e2e8f0" }} />
         <button
-          type="button"
-          onClick={handleExportPng}
-          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+          onClick={() => exportAs("png")}
+          style={btnStyle("#f8fafc", "#334155")}
         >
           PNG
         </button>
         <button
-          type="button"
-          onClick={handleExportJpg}
-          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+          onClick={() => exportAs("jpg")}
+          style={btnStyle("#f8fafc", "#334155")}
         >
           JPG
         </button>
         <button
-          type="button"
-          onClick={handleExportSvg}
-          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+          onClick={() => exportAs("svg")}
+          style={btnStyle("#f8fafc", "#334155")}
         >
           SVG
         </button>
       </div>
 
+      {/* SQL Panel */}
       <aside
-        className={`absolute right-4 top-16 z-20 flex h-[calc(100vh-5rem)] w-[520px] flex-col gap-3 rounded-2xl border border-slate-300 bg-white/95 p-4 shadow-xl transition-transform min-h-0 ${
-          isSchemaOpen ? "translate-x-0" : "translate-x-[570px]"
-        }`}
+        style={{
+          position: "absolute",
+          top: 56,
+          right: 12,
+          zIndex: 20,
+          width: 480,
+          height: "calc(100vh - 72px)",
+          background: "white",
+          border: "1px solid #cbd5e1",
+          borderRadius: 12,
+          boxShadow: "0 4px 24px rgba(0,0,0,0.10)",
+          display: "flex",
+          flexDirection: "column",
+          gap: 0,
+          transition: "transform 0.25s cubic-bezier(.4,0,.2,1)",
+          transform: panelOpen ? "translateX(0)" : "translateX(520px)",
+          overflow: "hidden",
+        }}
       >
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold">SQL Schema</h2>
-          <label className="cursor-pointer rounded-md border border-slate-300 bg-slate-50 px-3 py-1.5 text-sm font-medium hover:bg-slate-100">
-            Import File
+        {/* Panel header */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            padding: "10px 14px 8px",
+            borderBottom: "1px solid #e2e8f0",
+            background: "#f8fafc",
+          }}
+        >
+          <span style={{ fontSize: 13, fontWeight: 600, color: "#1e293b" }}>
+            SQL Schema
+          </span>
+          <label
+            style={{
+              ...btnStyle("#f1f5f9", "#334155"),
+              cursor: "pointer",
+              fontSize: 12,
+            }}
+          >
+            📂 Import
             <input
               type="file"
               accept=".sql,.txt"
-              onChange={handleFileImport}
-              className="hidden"
+              onChange={handleImport}
+              style={{ display: "none" }}
             />
           </label>
         </div>
-        {isSchemaOpen && (
-          <Editor
-            height="100%"
-            defaultLanguage="sql"
-            value={schemaInput}
-            onChange={handleEditorChange}
-            theme="vs-light"
-            options={{
-              minimap: { enabled: false },
+
+        {/* Textarea */}
+        <div style={{ flex: 1, overflow: "hidden", position: "relative" }}>
+          <textarea
+            ref={textareaRef}
+            value={sql}
+            onChange={(e) => setSql(e.target.value)}
+            spellCheck={false}
+            style={{
+              width: "100%",
+              height: "100%",
+              padding: "12px 14px",
+              fontFamily: '"Fira Code", "Cascadia Code", "Consolas", monospace',
               fontSize: 13,
-              lineNumbers: "on",
-              scrollBeyondLastLine: false,
-              automaticLayout: true,
-              tabSize: 2,
-              wordWrap: "on",
+              lineHeight: 1.6,
+              border: "none",
+              outline: "none",
+              resize: "none",
+              background: "#fafafa",
+              color: "#1e293b",
+              boxSizing: "border-box",
             }}
           />
-        )}
-        <p className="text-xs text-slate-600">
-          Paste SQL CREATE TABLE statements or import from file, then click Generate to create your ER diagram.
-        </p>
+        </div>
+
+        {/* Legend */}
+        <div
+          style={{
+            padding: "8px 14px",
+            borderTop: "1px solid #e2e8f0",
+            background: "#f8fafc",
+            display: "flex",
+            gap: 16,
+            flexWrap: "wrap",
+          }}
+        >
+          {[
+            { color: "#bfdbfe", label: "Entity (Table)" },
+            { color: "#fef3c7", label: "PK Attribute" },
+            { color: "#dcfce7", label: "FK Attribute" },
+            { color: "#f8fafc", label: "Attribute" },
+            { color: "#fef9c3", label: "Relationship" },
+          ].map(({ color, label }) => (
+            <div
+              key={label}
+              style={{ display: "flex", alignItems: "center", gap: 5 }}
+            >
+              <div
+                style={{
+                  width: 12,
+                  height: 12,
+                  background: color,
+                  border: "1px solid #94a3b8",
+                  borderRadius: 2,
+                }}
+              />
+              <span style={{ fontSize: 11, color: "#64748b" }}>{label}</span>
+            </div>
+          ))}
+        </div>
+
+        {/* Generate button */}
+        <div
+          style={{
+            padding: "10px 14px",
+            borderTop: "1px solid #e2e8f0",
+            background: "#f8fafc",
+          }}
+        >
+          <button
+            onClick={handleGenerate}
+            style={{
+              ...btnStyle("#1d4ed8", "white", true),
+              width: "100%",
+              justifyContent: "center",
+              fontSize: 13,
+            }}
+          >
+            ⚡ Generate ER Diagram
+          </button>
+        </div>
       </aside>
 
-      {errorMessage ? (
-        <div className="absolute bottom-4 left-1/2 z-20 -translate-x-1/2 rounded-md border border-red-300 bg-red-50 px-4 py-2 text-sm text-red-800 shadow">
-          {errorMessage}
+      {/* Error toast */}
+      {error && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 20,
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 40,
+            background: "#fef2f2",
+            border: "1px solid #fca5a5",
+            borderRadius: 8,
+            padding: "8px 16px",
+            color: "#991b1b",
+            fontSize: 13,
+            boxShadow: "0 2px 8px rgba(0,0,0,0.1)",
+          }}
+        >
+          ⚠️ {error}
         </div>
-      ) : null}
+      )}
 
-      <div className="h-full w-full">
+      {/* Canvas */}
+      <div style={{ width: "100%", height: "100%" }}>
         <Excalidraw
-          key={`${layoutSeed}:${diagram.entities.length}`}
+          key={key}
           initialData={initialData}
-          excalidrawAPI={(api) => {
-            excalidrawApiRef.current = api as unknown as ExcalidrawApiSnapshot;
+          excalidrawAPI={(api: any) => {
+            excalidrawApiRef.current = api;
           }}
           UIOptions={{
             canvasActions: {
@@ -1435,9 +1221,29 @@ export default function Home() {
               export: false,
             },
           }}
-          gridModeEnabled
         />
       </div>
     </main>
   );
+}
+
+function btnStyle(
+  bg: string,
+  color: string,
+  primary?: boolean,
+): React.CSSProperties {
+  return {
+    background: bg,
+    color,
+    border: primary ? "none" : "1px solid #e2e8f0",
+    borderRadius: 7,
+    padding: "5px 12px",
+    fontSize: 12,
+    fontWeight: primary ? 600 : 500,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    gap: 4,
+    boxShadow: primary ? "0 1px 3px rgba(29,78,216,0.3)" : undefined,
+  };
 }
