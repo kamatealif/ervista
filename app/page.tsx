@@ -545,6 +545,7 @@ const makeText = (
   };
 };
 
+// Simple 2-point line (used for entity→attribute spokes)
 const makeLine = (
   x1: number,
   y1: number,
@@ -579,10 +580,184 @@ const makeLine = (
   ...extra,
 });
 
+// Multi-segment polyline — takes ABSOLUTE points, converts to relative
+const makePolyline = (
+  absPoints: Point[],
+  extra: Record<string, unknown> = {},
+): ExElement => {
+  const origin = absPoints[0]!;
+  const rel = absPoints.map((p) => [
+    +(p.x - origin.x).toFixed(2),
+    +(p.y - origin.y).toFixed(2),
+  ]);
+  const xs = absPoints.map((p) => p.x),
+    ys = absPoints.map((p) => p.y);
+  return {
+    ...BASE,
+    id: eid(),
+    type: "line",
+    x: origin.x,
+    y: origin.y,
+    width: Math.max(...xs) - Math.min(...xs),
+    height: Math.max(...ys) - Math.min(...ys),
+    strokeColor: "#64748b",
+    backgroundColor: "transparent",
+    fillStyle: "solid",
+    strokeWidth: 1.5,
+    strokeStyle: "solid",
+    roughness: 0,
+    roundness: { type: 2 },
+    seed: Math.floor(Math.random() * 999999),
+    points: rel,
+    lastCommittedPoint: null,
+    startBinding: null,
+    endBinding: null,
+    startArrowhead: null,
+    endArrowhead: null,
+    ...extra,
+  };
+};
+
+// ── Obstacle-aware orthogonal router ─────────────────────────────────────────
+
+type Rect = { x: number; y: number; w: number; h: number };
+
+function segHitsRect(
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+  r: Rect,
+): boolean {
+  const minX = Math.min(ax, bx),
+    maxX = Math.max(ax, bx);
+  const minY = Math.min(ay, by),
+    maxY = Math.max(ay, by);
+  if (maxX < r.x || minX > r.x + r.w || maxY < r.y || minY > r.y + r.h)
+    return false;
+  if (Math.abs(ax - bx) < 0.5)
+    return ax >= r.x && ax <= r.x + r.w && maxY >= r.y && minY <= r.y + r.h;
+  if (Math.abs(ay - by) < 0.5)
+    return ay >= r.y && ay <= r.y + r.h && maxX >= r.x && minX <= r.x + r.w;
+  return true;
+}
+
+function countHits(pts: Point[], obs: Rect[]): number {
+  let hits = 0;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i]!,
+      b = pts[i + 1]!;
+    for (const r of obs)
+      if (segHitsRect(a.x, a.y, b.x, b.y, r)) {
+        hits++;
+        break;
+      }
+  }
+  return hits;
+}
+
+function pathLen(pts: Point[]): number {
+  let len = 0;
+  for (let i = 0; i < pts.length - 1; i++)
+    len += Math.hypot(pts[i + 1]!.x - pts[i]!.x, pts[i + 1]!.y - pts[i]!.y);
+  return len;
+}
+
+function simplify(pts: Point[]): Point[] {
+  if (pts.length <= 2) return pts;
+  const out: Point[] = [pts[0]!];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const p = out[out.length - 1]!,
+      c = pts[i]!,
+      n = pts[i + 1]!;
+    const collinear =
+      (Math.abs(p.x - c.x) < 0.5 && Math.abs(c.x - n.x) < 0.5) ||
+      (Math.abs(p.y - c.y) < 0.5 && Math.abs(c.y - n.y) < 0.5);
+    if (!collinear) out.push(c);
+  }
+  out.push(pts[pts.length - 1]!);
+  return out;
+}
+
+function routeAvoiding(start: Point, end: Point, obs: Rect[]): Point[] {
+  const CLEAR = 24;
+  const inflated = obs.map((r) => ({
+    x: r.x - CLEAR,
+    y: r.y - CLEAR,
+    w: r.w + CLEAR * 2,
+    h: r.h + CLEAR * 2,
+  }));
+
+  if (countHits([start, end], inflated) === 0) return [start, end];
+
+  const xCoords = new Set<number>([start.x, end.x, (start.x + end.x) / 2]);
+  const yCoords = new Set<number>([start.y, end.y, (start.y + end.y) / 2]);
+  for (const r of inflated) {
+    xCoords.add(r.x - CLEAR);
+    xCoords.add(r.x + r.w + CLEAR);
+    yCoords.add(r.y - CLEAR);
+    yCoords.add(r.y + r.h + CLEAR);
+  }
+
+  const candidates: Point[][] = [];
+  for (const x of xCoords)
+    candidates.push([start, { x, y: start.y }, { x, y: end.y }, end]);
+  for (const y of yCoords)
+    candidates.push([start, { x: start.x, y }, { x: end.x, y }, end]);
+  for (const x of xCoords) {
+    for (const y of yCoords) {
+      candidates.push([
+        start,
+        { x, y: start.y },
+        { x, y },
+        { x: end.x, y },
+        end,
+      ]);
+      candidates.push([
+        start,
+        { x: start.x, y },
+        { x, y },
+        { x, y: end.y },
+        end,
+      ]);
+    }
+  }
+
+  let best: Point[] = [start, end];
+  let bestHits = Infinity,
+    bestLen = Infinity;
+  for (const c of candidates) {
+    const s = simplify(c);
+    const h = countHits(s, inflated);
+    const l = pathLen(s);
+    if (h < bestHits || (h === bestHits && l < bestLen)) {
+      best = s;
+      bestHits = h;
+      bestLen = l;
+    }
+  }
+  return simplify(best);
+}
+
 function buildElements(layout: DiagramLayout): ExElement[] {
   const el: ExElement[] = [];
 
-  // Entities + attributes
+  const allAttrObs: Rect[] = layout.entities.flatMap((ent) =>
+    ent.attributes.map((a) => ({
+      x: a.x - a.rx,
+      y: a.y - a.ry,
+      w: a.rx * 2,
+      h: a.ry * 2,
+    })),
+  );
+  const allEntityObs: Rect[] = layout.entities.map((ent) => ({
+    x: ent.x,
+    y: ent.y,
+    w: ent.width,
+    h: ent.height,
+  }));
+
+  // ── Entities + attributes ──────────────────────────────────────────
   for (const ent of layout.entities) {
     el.push(
       makeRect(ent.x, ent.y, ent.width, ent.height, {
@@ -596,14 +771,15 @@ function buildElements(layout: DiagramLayout): ExElement[] {
     );
 
     for (const attr of ent.attributes) {
-      // Line entity → attribute
       el.push(
         makeLine(
           attr.lineStart.x,
           attr.lineStart.y,
           attr.lineEnd.x,
           attr.lineEnd.y,
-          { strokeColor: "#94a3b8" },
+          {
+            strokeColor: "#94a3b8",
+          },
         ),
       );
 
@@ -632,7 +808,6 @@ function buildElements(layout: DiagramLayout): ExElement[] {
         ),
       );
 
-      // Double-border for PK
       if (attr.isPrimary) {
         const ins = 4;
         el.push(
@@ -662,7 +837,7 @@ function buildElements(layout: DiagramLayout): ExElement[] {
     }
   }
 
-  // Relationships
+  // ── Relationships ──────────────────────────────────────────────────
   for (const ent of layout.entities) {
     for (const attr of ent.attributes) {
       if (!attr.isForeign || !attr.references) continue;
@@ -694,37 +869,42 @@ function buildElements(layout: DiagramLayout): ExElement[] {
         return { x: mx + ddx * t, y: my + ddy * t };
       };
 
-      const src = rectEdgePoint(ent, { x: mx, y: my });
-      const de = dEdge(src.x, src.y);
-      el.push(makeLine(src.x, src.y, de.x, de.y, { strokeColor: "#64748b" }));
-      el.push(
-        makeText(
-          (src.x + de.x) / 2 + 8,
-          (src.y + de.y) / 2 - 14,
-          "1",
-          12,
-          true,
-          { strokeColor: "#475569" },
+      const routeObs = [
+        ...allAttrObs,
+        ...allEntityObs.filter(
+          (r) =>
+            !(r.x === ent.x && r.y === ent.y) &&
+            !(r.x === tgt.x && r.y === tgt.y),
         ),
+      ];
+
+      // Source → diamond
+      const src = rectEdgePoint(ent, { x: mx, y: my });
+      const dEntry = dEdge(src.x, src.y);
+      const srcPath = routeAvoiding(src, dEntry, routeObs);
+      el.push(makePolyline(srcPath, { strokeColor: "#64748b" }));
+      const srcMid = srcPath[Math.floor(srcPath.length / 2)]!;
+      el.push(
+        makeText(srcMid.x + 10, srcMid.y - 14, "1", 12, true, {
+          strokeColor: "#475569",
+        }),
       );
 
-      const tp = rectEdgePoint(tgt, { x: mx, y: my });
-      const dx2 = dEdge(tp.x, tp.y);
+      // Diamond → target
+      const tgtPt = rectEdgePoint(tgt, { x: mx, y: my });
+      const dExit = dEdge(tgtPt.x, tgtPt.y);
+      const tgtPath = routeAvoiding(dExit, tgtPt, routeObs);
       el.push(
-        makeLine(dx2.x, dx2.y, tp.x, tp.y, {
+        makePolyline(tgtPath, {
           strokeColor: "#64748b",
           endArrowhead: "arrow",
         }),
       );
+      const tgtMid = tgtPath[Math.floor(tgtPath.length / 2)]!;
       el.push(
-        makeText(
-          (tp.x + dx2.x) / 2 + 8,
-          (tp.y + dx2.y) / 2 - 14,
-          "N",
-          12,
-          true,
-          { strokeColor: "#475569" },
-        ),
+        makeText(tgtMid.x + 10, tgtMid.y - 14, "N", 12, true, {
+          strokeColor: "#475569",
+        }),
       );
     }
   }
