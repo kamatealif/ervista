@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useMemo, useState, useCallback, useRef, useEffect } from "react";
+import { useMemo, useState, useRef } from "react";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -31,9 +31,8 @@ function stripIdentifierQuotes(value: string): string {
     (t.startsWith('"') && t.endsWith('"')) ||
     (t.startsWith("`") && t.endsWith("`")) ||
     (t.startsWith("'") && t.endsWith("'"))
-  ) {
+  )
     return t.slice(1, -1).trim();
-  }
   if (t.startsWith("[") && t.endsWith("]")) return t.slice(1, -1).trim();
   return t;
 }
@@ -68,9 +67,8 @@ function splitTopLevelComma(input: string): string[] {
         continue;
       }
       if (ch === quote) {
-        if (quote === "'" && input[i + 1] === "'") {
-          i++;
-        } else quote = null;
+        if (quote === "'" && input[i + 1] === "'") i++;
+        else quote = null;
       }
       continue;
     }
@@ -247,7 +245,7 @@ function parseSqlSchema(sql: string): DiagramModel {
   return { entities };
 }
 
-// ─── Layout Engine ────────────────────────────────────────────────────────────
+// ─── Layout (with random seed) ────────────────────────────────────────────────
 
 type Point = { x: number; y: number };
 
@@ -283,15 +281,26 @@ type DiagramLayout = {
   entities: LayoutEntity[];
 };
 
+// Simple seeded PRNG (mulberry32)
+function makeRng(seed: number) {
+  let s = seed >>> 0;
+  return () => {
+    s |= 0;
+    s = (s + 0x6d2b79f5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 function rectEdgePoint(entity: LayoutEntity, target: Point): Point {
-  const dx = target.x - entity.cx;
-  const dy = target.y - entity.cy;
-  if (Math.abs(dx) * entity.height >= Math.abs(dy) * entity.width) {
+  const dx = target.x - entity.cx,
+    dy = target.y - entity.cy;
+  if (Math.abs(dx) * entity.height >= Math.abs(dy) * entity.width)
     return {
       x: entity.x + (dx >= 0 ? entity.width : 0),
       y: entity.cy + (dy * (entity.width / 2)) / Math.max(1, Math.abs(dx)),
     };
-  }
   return {
     x: entity.cx + (dx * (entity.height / 2)) / Math.max(1, Math.abs(dy)),
     y: entity.y + (dy >= 0 ? entity.height : 0),
@@ -305,8 +314,8 @@ function ellipseEdgePoint(
   ry: number,
   target: Point,
 ): Point {
-  const dx = target.x - cx;
-  const dy = target.y - cy;
+  const dx = target.x - cx,
+    dy = target.y - cy;
   const len = Math.hypot(dx, dy) || 1;
   const ux = dx / len,
     uy = dy / len;
@@ -314,37 +323,54 @@ function ellipseEdgePoint(
   return { x: cx + ux * scale, y: cy + uy * scale };
 }
 
-function buildLayout(model: DiagramModel): DiagramLayout {
+function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
   if (!model.entities.length) return { width: 1600, height: 900, entities: [] };
+
+  const rng = makeRng(seed);
 
   const ENT_W = 200,
     ENT_H = 70;
   const ATT_RX = 72,
     ATT_RY = 26;
-  const ORBIT_R = 160;
-  const PAD = 280;
-  const CELL_W = (ORBIT_R + ATT_RX) * 2 + 120;
-  const CELL_H = (ORBIT_R + ATT_RY) * 2 + 120;
+  const ORBIT_R = 165;
+  const PAD = 300;
+  const CELL_W = (ORBIT_R + ATT_RX) * 2 + 140;
+  const CELL_H = (ORBIT_R + ATT_RY) * 2 + 140;
 
-  const cols = Math.max(1, Math.ceil(Math.sqrt(model.entities.length)));
-  const rows = Math.ceil(model.entities.length / cols);
+  const n = model.entities.length;
+  // Randomize column count slightly: prefer sqrt but jitter by ±1
+  const baseCols = Math.max(1, Math.ceil(Math.sqrt(n)));
+  const cols = Math.max(1, baseCols + (rng() > 0.5 && baseCols > 1 ? -1 : 0));
+  const rows = Math.ceil(n / cols);
 
   const canvasW = Math.max(1600, cols * CELL_W + PAD * 2);
   const canvasH = Math.max(900, rows * CELL_H + PAD * 2);
 
-  const entities: LayoutEntity[] = model.entities.map((ent, i) => {
-    const col = i % cols;
-    const row = Math.floor(i / cols);
-    const cx = PAD + col * CELL_W + CELL_W / 2;
-    const cy = PAD + row * CELL_H + CELL_H / 2;
-    const x = cx - ENT_W / 2;
-    const y = cy - ENT_H / 2;
+  // Build shuffled entity order per seed
+  const indices = Array.from({ length: n }, (_, i) => i);
+  for (let i = indices.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [indices[i], indices[j]] = [indices[j]!, indices[i]!];
+  }
+
+  const entities: LayoutEntity[] = model.entities.map((ent, originalIdx) => {
+    // find this entity's slot in the shuffled grid
+    const slotIdx = indices.indexOf(originalIdx);
+    const col = slotIdx % cols;
+    const row = Math.floor(slotIdx / cols);
+
+    // Add a small random jitter to each entity center so it doesn't look grid-locked
+    const jitterX = (rng() - 0.5) * 60;
+    const jitterY = (rng() - 0.5) * 60;
+
+    const cx = PAD + col * CELL_W + CELL_W / 2 + jitterX;
+    const cy = PAD + row * CELL_H + CELL_H / 2 + jitterY;
 
     const entity: LayoutEntity = {
       id: `ent-${ent.name.toLowerCase().replace(/\W+/g, "_")}`,
       name: getShortName(ent.name),
-      x,
-      y,
+      x: cx - ENT_W / 2,
+      y: cy - ENT_H / 2,
       width: ENT_W,
       height: ENT_H,
       cx,
@@ -353,30 +379,25 @@ function buildLayout(model: DiagramModel): DiagramLayout {
     };
 
     const count = ent.attributes.length;
+    // Randomize the starting angle so attributes fan out differently each time
+    const startAngle = rng() * Math.PI * 2;
+
     ent.attributes.forEach((attr, j) => {
-      // distribute attributes evenly around the entity
       const angle =
-        count === 1 ? -Math.PI / 2 : -Math.PI / 2 + (2 * Math.PI * j) / count;
-
-      const orbitX = ORBIT_R + ATT_RX * 0.4;
-      const orbitY = ORBIT_R + ATT_RY * 0.4;
-
-      const ax = cx + orbitX * Math.cos(angle);
-      const ay = cy + orbitY * Math.sin(angle);
-
+        count === 1 ? -Math.PI / 2 : startAngle + (2 * Math.PI * j) / count;
+      const ax = cx + (ORBIT_R + ATT_RX * 0.4) * Math.cos(angle);
+      const ay = cy + (ORBIT_R + ATT_RY * 0.4) * Math.sin(angle);
       const lineStart = rectEdgePoint(entity, { x: ax, y: ay });
       const lineEnd = ellipseEdgePoint(ax, ay, ATT_RX, ATT_RY, lineStart);
-
-      const label =
-        attr.name + (attr.isPrimary ? " (PK)" : attr.isForeign ? " (FK)" : "");
-
       entity.attributes.push({
         id: `${entity.id}-attr-${attr.name.toLowerCase().replace(/\W+/g, "_")}`,
         x: ax,
         y: ay,
         rx: ATT_RX,
         ry: ATT_RY,
-        label,
+        label:
+          attr.name +
+          (attr.isPrimary ? " (PK)" : attr.isForeign ? " (FK)" : ""),
         lineStart,
         lineEnd,
         isPrimary: attr.isPrimary,
@@ -394,136 +415,113 @@ function buildLayout(model: DiagramModel): DiagramLayout {
 // ─── Excalidraw Element Builder ───────────────────────────────────────────────
 
 type ExElement = Record<string, unknown>;
-
 let _eid = 1;
-function eid() {
-  return `el-${_eid++}-${Math.random().toString(36).slice(2)}`;
-}
+const eid = () => `el-${_eid++}-${Math.random().toString(36).slice(2)}`;
+const BASE = {
+  angle: 0,
+  opacity: 100,
+  isDeleted: false,
+  frameId: null,
+  link: null,
+  locked: false,
+  groupIds: [],
+  version: 1,
+  versionNonce: 1,
+};
 
-function makeRect(
+const makeRect = (
   x: number,
   y: number,
   w: number,
   h: number,
   extra: Record<string, unknown> = {},
-): ExElement {
-  return {
-    id: eid(),
-    type: "rectangle",
-    x,
-    y,
-    width: w,
-    height: h,
-    angle: 0,
-    opacity: 100,
-    strokeColor: "#1e293b",
-    backgroundColor: "#dbeafe",
-    fillStyle: "solid",
-    strokeWidth: 2,
-    strokeStyle: "solid",
-    roughness: 0,
-    roundness: { type: 3, value: 6 },
-    isDeleted: false,
-    frameId: null,
-    link: null,
-    locked: false,
-    groupIds: [],
-    seed: Math.floor(Math.random() * 999999),
-    version: 1,
-    versionNonce: 1,
-    ...extra,
-  };
-}
+): ExElement => ({
+  ...BASE,
+  id: eid(),
+  type: "rectangle",
+  x,
+  y,
+  width: w,
+  height: h,
+  strokeColor: "#1e293b",
+  backgroundColor: "#dbeafe",
+  fillStyle: "solid",
+  strokeWidth: 2,
+  strokeStyle: "solid",
+  roughness: 0,
+  roundness: { type: 3, value: 6 },
+  seed: Math.floor(Math.random() * 999999),
+  ...extra,
+});
 
-function makeEllipse(
+const makeEllipse = (
   x: number,
   y: number,
   w: number,
   h: number,
   extra: Record<string, unknown> = {},
-): ExElement {
-  return {
-    id: eid(),
-    type: "ellipse",
-    x,
-    y,
-    width: w,
-    height: h,
-    angle: 0,
-    opacity: 100,
-    strokeColor: "#1e293b",
-    backgroundColor: "#f0fdf4",
-    fillStyle: "solid",
-    strokeWidth: 1.5,
-    strokeStyle: "solid",
-    roughness: 0,
-    roundness: { type: 2 },
-    isDeleted: false,
-    frameId: null,
-    link: null,
-    locked: false,
-    groupIds: [],
-    seed: Math.floor(Math.random() * 999999),
-    version: 1,
-    versionNonce: 1,
-    ...extra,
-  };
-}
+): ExElement => ({
+  ...BASE,
+  id: eid(),
+  type: "ellipse",
+  x,
+  y,
+  width: w,
+  height: h,
+  strokeColor: "#334155",
+  backgroundColor: "#f0fdf4",
+  fillStyle: "solid",
+  strokeWidth: 1.5,
+  strokeStyle: "solid",
+  roughness: 0,
+  roundness: { type: 2 },
+  seed: Math.floor(Math.random() * 999999),
+  ...extra,
+});
 
-function makeDiamond(
+const makeDiamond = (
   x: number,
   y: number,
   w: number,
   h: number,
   extra: Record<string, unknown> = {},
-): ExElement {
-  return {
-    id: eid(),
-    type: "diamond",
-    x,
-    y,
-    width: w,
-    height: h,
-    angle: 0,
-    opacity: 100,
-    strokeColor: "#1e293b",
-    backgroundColor: "#fef9c3",
-    fillStyle: "solid",
-    strokeWidth: 1.5,
-    strokeStyle: "solid",
-    roughness: 0,
-    roundness: null,
-    isDeleted: false,
-    frameId: null,
-    link: null,
-    locked: false,
-    groupIds: [],
-    seed: Math.floor(Math.random() * 999999),
-    version: 1,
-    versionNonce: 1,
-    ...extra,
-  };
-}
+): ExElement => ({
+  ...BASE,
+  id: eid(),
+  type: "diamond",
+  x,
+  y,
+  width: w,
+  height: h,
+  strokeColor: "#78350f",
+  backgroundColor: "#fef9c3",
+  fillStyle: "solid",
+  strokeWidth: 1.5,
+  strokeStyle: "solid",
+  roughness: 0,
+  roundness: null,
+  seed: Math.floor(Math.random() * 999999),
+  ...extra,
+});
 
-function makeText(
+const makeText = (
   x: number,
   y: number,
   text: string,
   fontSize = 14,
   bold = false,
   extra: Record<string, unknown> = {},
-): ExElement {
-  const approxW = text.length * fontSize * 0.6 + 16;
-  const approxH = fontSize * 1.4;
+): ExElement => {
+  const w = text.length * fontSize * 0.6 + 16,
+    h = fontSize * 1.4;
   return {
+    ...BASE,
     id: eid(),
     type: "text",
-    x: x - approxW / 2,
-    y: y - approxH / 2,
-    width: approxW,
-    height: approxH,
-    angle: 0,
-    opacity: 100,
+    x: x - w / 2,
+    y: y - h / 2,
+    width: w,
+    height: h,
     strokeColor: "#0f172a",
     backgroundColor: "transparent",
     fillStyle: "solid",
@@ -531,17 +529,10 @@ function makeText(
     strokeStyle: "solid",
     roughness: 0,
     roundness: null,
-    isDeleted: false,
-    frameId: null,
-    link: null,
-    locked: false,
-    groupIds: [],
     seed: Math.floor(Math.random() * 999999),
-    version: 1,
-    versionNonce: 1,
     text,
     fontSize,
-    fontFamily: 3, // monospace
+    fontFamily: 3,
     textAlign: "center",
     verticalAlign: "middle",
     baseline: Math.floor(fontSize * 0.9),
@@ -552,162 +543,104 @@ function makeText(
     fontStyle: bold ? "bold" : "normal",
     ...extra,
   };
-}
+};
 
-function makeLine(
+const makeLine = (
   x1: number,
   y1: number,
   x2: number,
   y2: number,
   extra: Record<string, unknown> = {},
-): ExElement {
-  return {
-    id: eid(),
-    type: "line",
-    x: x1,
-    y: y1,
-    width: Math.abs(x2 - x1),
-    height: Math.abs(y2 - y1),
-    angle: 0,
-    opacity: 100,
-    strokeColor: "#334155",
-    backgroundColor: "transparent",
-    fillStyle: "solid",
-    strokeWidth: 1.5,
-    strokeStyle: "solid",
-    roughness: 0,
-    roundness: null,
-    isDeleted: false,
-    frameId: null,
-    link: null,
-    locked: false,
-    groupIds: [],
-    seed: Math.floor(Math.random() * 999999),
-    version: 1,
-    versionNonce: 1,
-    points: [
-      [0, 0],
-      [x2 - x1, y2 - y1],
-    ],
-    lastCommittedPoint: null,
-    startBinding: null,
-    endBinding: null,
-    startArrowhead: null,
-    endArrowhead: null,
-    ...extra,
-  };
-}
-
-function makeArrow(
-  x1: number,
-  y1: number,
-  x2: number,
-  y2: number,
-  label?: string,
-  extra: Record<string, unknown> = {},
-): ExElement {
-  return {
-    id: eid(),
-    type: "arrow",
-    x: x1,
-    y: y1,
-    width: Math.abs(x2 - x1),
-    height: Math.abs(y2 - y1),
-    angle: 0,
-    opacity: 100,
-    strokeColor: "#475569",
-    backgroundColor: "transparent",
-    fillStyle: "solid",
-    strokeWidth: 1.5,
-    strokeStyle: "solid",
-    roughness: 0,
-    roundness: { type: 2 },
-    isDeleted: false,
-    frameId: null,
-    link: null,
-    locked: false,
-    groupIds: [],
-    seed: Math.floor(Math.random() * 999999),
-    version: 1,
-    versionNonce: 1,
-    points: [
-      [0, 0],
-      [x2 - x1, y2 - y1],
-    ],
-    lastCommittedPoint: null,
-    startBinding: null,
-    endBinding: null,
-    startArrowhead: null,
-    endArrowhead: null,
-    ...extra,
-  };
-}
+): ExElement => ({
+  ...BASE,
+  id: eid(),
+  type: "line",
+  x: x1,
+  y: y1,
+  width: Math.abs(x2 - x1),
+  height: Math.abs(y2 - y1),
+  strokeColor: "#64748b",
+  backgroundColor: "transparent",
+  fillStyle: "solid",
+  strokeWidth: 1.5,
+  strokeStyle: "solid",
+  roughness: 0,
+  roundness: null,
+  seed: Math.floor(Math.random() * 999999),
+  points: [
+    [0, 0],
+    [x2 - x1, y2 - y1],
+  ],
+  lastCommittedPoint: null,
+  startBinding: null,
+  endBinding: null,
+  startArrowhead: null,
+  endArrowhead: null,
+  ...extra,
+});
 
 function buildElements(layout: DiagramLayout): ExElement[] {
-  const elements: ExElement[] = [];
+  const el: ExElement[] = [];
 
-  // Draw entity-attribute lines, ellipses, entity rectangles
+  // Entities + attributes
   for (const ent of layout.entities) {
-    // Entity rectangle
-    elements.push(
+    el.push(
       makeRect(ent.x, ent.y, ent.width, ent.height, {
         strokeColor: "#1e40af",
         backgroundColor: "#bfdbfe",
         strokeWidth: 2,
       }),
     );
-    elements.push(
-      makeText(ent.cx, ent.cy, ent.name, 16, true, {
-        strokeColor: "#1e3a8a",
-      }),
+    el.push(
+      makeText(ent.cx, ent.cy, ent.name, 16, true, { strokeColor: "#1e3a8a" }),
     );
 
-    // Attributes
     for (const attr of ent.attributes) {
-      // Line from entity to attribute
-      elements.push(
+      // Line entity → attribute
+      el.push(
         makeLine(
           attr.lineStart.x,
           attr.lineStart.y,
           attr.lineEnd.x,
           attr.lineEnd.y,
-          { strokeColor: "#64748b", strokeWidth: 1.5 },
+          { strokeColor: "#94a3b8" },
         ),
       );
 
-      // Ellipse: double ellipse for PK (draw two)
-      const bgColor = attr.isPrimary
+      const bg = attr.isPrimary
         ? "#fef3c7"
         : attr.isForeign
           ? "#dcfce7"
-          : "#f8fafc";
-      const strokeColor = attr.isPrimary
+          : "#ffffff";
+      const sc = attr.isPrimary
         ? "#92400e"
         : attr.isForeign
           ? "#14532d"
-          : "#334155";
-      elements.push(
+          : "#475569";
+
+      el.push(
         makeEllipse(
           attr.x - attr.rx,
           attr.y - attr.ry,
           attr.rx * 2,
           attr.ry * 2,
           {
-            backgroundColor: bgColor,
-            strokeColor,
+            backgroundColor: bg,
+            strokeColor: sc,
             strokeWidth: attr.isPrimary ? 2 : 1.5,
           },
         ),
       );
-      // Double ellipse border for PK
+
+      // Double-border for PK
       if (attr.isPrimary) {
-        const inset = 4;
-        elements.push(
+        const ins = 4;
+        el.push(
           makeEllipse(
-            attr.x - attr.rx + inset,
-            attr.y - attr.ry + inset,
-            (attr.rx - inset) * 2,
-            (attr.ry - inset) * 2,
+            attr.x - attr.rx + ins,
+            attr.y - attr.ry + ins,
+            (attr.rx - ins) * 2,
+            (attr.ry - ins) * 2,
             {
               backgroundColor: "transparent",
               strokeColor: "#92400e",
@@ -717,111 +650,86 @@ function buildElements(layout: DiagramLayout): ExElement[] {
         );
       }
 
-      // Attribute label (underline for PK shown via bold)
-      elements.push(
+      el.push(
         makeText(attr.x, attr.y, attr.label, 12, attr.isPrimary, {
           strokeColor: attr.isPrimary
             ? "#78350f"
             : attr.isForeign
               ? "#14532d"
-              : "#1e293b",
+              : "#334155",
         }),
       );
     }
   }
 
-  // Draw relationships (FK → referenced table) with diamond
+  // Relationships
   for (const ent of layout.entities) {
     for (const attr of ent.attributes) {
       if (!attr.isForeign || !attr.references) continue;
-
-      const targetEnt = layout.entities.find(
+      const tgt = layout.entities.find(
         (e) =>
           getShortName(e.name).toLowerCase() ===
           getShortName(attr.references!).toLowerCase(),
       );
-      if (!targetEnt) continue;
+      if (!tgt) continue;
 
-      // Place diamond between the two entity centers
-      const mx = (ent.cx + targetEnt.cx) / 2;
-      const my = (ent.cy + targetEnt.cy) / 2;
+      const mx = (ent.cx + tgt.cx) / 2;
+      const my = (ent.cy + tgt.cy) / 2;
       const DW = 110,
         DH = 54;
-      const dx = mx - DW / 2;
-      const dy = my - DH / 2;
-      const dcx = mx,
-        dcy = my;
 
-      elements.push(
-        makeDiamond(dx, dy, DW, DH, {
-          strokeColor: "#713f12",
-          backgroundColor: "#fef9c3",
-          strokeWidth: 1.5,
-        }),
-      );
-      elements.push(
-        makeText(dcx, dcy, "has", 12, false, {
-          strokeColor: "#713f12",
-        }),
-      );
+      el.push(makeDiamond(mx - DW / 2, my - DH / 2, DW, DH));
+      el.push(makeText(mx, my, "has", 12, false, { strokeColor: "#78350f" }));
 
-      // Diamond edge points
-      function diamondEdge(tx: number, ty: number): Point {
-        const ddx = tx - dcx,
-          ddy = ty - dcy;
+      const dEdge = (tx: number, ty: number): Point => {
+        const ddx = tx - mx,
+          ddy = ty - my;
         const hw = DW / 2,
           hh = DH / 2;
-        const adx = Math.abs(ddx),
-          ady = Math.abs(ddy);
-        if (adx * hh > ady * hw) {
-          const t = hw / adx;
-          return { x: dcx + ddx * t, y: dcy + ddy * t };
+        if (Math.abs(ddx) * hh > Math.abs(ddy) * hw) {
+          const t = hw / Math.abs(ddx);
+          return { x: mx + ddx * t, y: my + ddy * t };
         }
-        const t = hh / Math.max(ady, 0.001);
-        return { x: dcx + ddx * t, y: dcy + ddy * t };
-      }
+        const t = hh / Math.max(Math.abs(ddy), 0.001);
+        return { x: mx + ddx * t, y: my + ddy * t };
+      };
 
-      // Source entity → diamond
-      const srcPt = rectEdgePoint(ent, { x: dcx, y: dcy });
-      const dEntry = diamondEdge(srcPt.x, srcPt.y);
-      elements.push(
-        makeLine(srcPt.x, srcPt.y, dEntry.x, dEntry.y, {
-          strokeColor: "#475569",
-          strokeWidth: 1.5,
-        }),
-      );
-      // Cardinality labels
-      elements.push(
+      const src = rectEdgePoint(ent, { x: mx, y: my });
+      const de = dEdge(src.x, src.y);
+      el.push(makeLine(src.x, src.y, de.x, de.y, { strokeColor: "#64748b" }));
+      el.push(
         makeText(
-          (srcPt.x + dEntry.x) / 2,
-          (srcPt.y + dEntry.y) / 2 - 12,
+          (src.x + de.x) / 2 + 8,
+          (src.y + de.y) / 2 - 14,
           "1",
-          11,
+          12,
+          true,
+          { strokeColor: "#475569" },
         ),
       );
 
-      // Diamond → target entity
-      const tgtPt = rectEdgePoint(targetEnt, { x: dcx, y: dcy });
-      const dExit = diamondEdge(tgtPt.x, tgtPt.y);
-      elements.push(
-        makeLine(dExit.x, dExit.y, tgtPt.x, tgtPt.y, {
-          strokeColor: "#475569",
-          strokeWidth: 1.5,
+      const tp = rectEdgePoint(tgt, { x: mx, y: my });
+      const dx2 = dEdge(tp.x, tp.y);
+      el.push(
+        makeLine(dx2.x, dx2.y, tp.x, tp.y, {
+          strokeColor: "#64748b",
           endArrowhead: "arrow",
         }),
       );
-      elements.push(
+      el.push(
         makeText(
-          (tgtPt.x + dExit.x) / 2,
-          (tgtPt.y + dExit.y) / 2 - 12,
+          (tp.x + dx2.x) / 2 + 8,
+          (tp.y + dx2.y) / 2 - 14,
           "N",
-          11,
+          12,
+          true,
+          { strokeColor: "#475569" },
         ),
       );
     }
   }
 
-  return elements;
+  return el;
 }
 
 // ─── Sample SQL ───────────────────────────────────────────────────────────────
@@ -850,71 +758,88 @@ CREATE TABLE order_items (
   CONSTRAINT fk_order FOREIGN KEY (order_id) REFERENCES orders(id)
 );`;
 
-// ─── Excalidraw Dynamic Import ────────────────────────────────────────────────
+// ─── Excalidraw ───────────────────────────────────────────────────────────────
 
 const Excalidraw = dynamic(
   () => import("@excalidraw/excalidraw").then((m) => m.Excalidraw),
   {
     ssr: false,
     loading: () => (
-      <div className="flex items-center justify-center h-full text-slate-400">
+      <div className="flex h-full w-full items-center justify-center bg-white text-gray-400 text-sm">
         Loading canvas…
       </div>
     ),
   },
 );
 
-// ─── Main Component ───────────────────────────────────────────────────────────
+const LEGEND = [
+  { color: "bg-blue-200 border-blue-400", label: "Entity (Table)" },
+  { color: "bg-amber-100 border-amber-500", label: "Primary Key" },
+  { color: "bg-emerald-100 border-emerald-500", label: "Foreign Key" },
+  { color: "bg-white border-gray-400", label: "Attribute" },
+  { color: "bg-yellow-100 border-yellow-500", label: "Relationship" },
+];
+
+// ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function ERDiagramPage() {
   const [sql, setSql] = useState(SAMPLE_SQL);
   const [model, setModel] = useState<DiagramModel>(() =>
     parseSqlSchema(SAMPLE_SQL),
   );
+  const [layoutSeed, setLayoutSeed] = useState(42);
   const [error, setError] = useState("");
   const [panelOpen, setPanelOpen] = useState(true);
-  const [key, setKey] = useState(0);
+  const [generating, setGenerating] = useState(false);
+  const [excalidrawKey, setExcalidrawKey] = useState(0);
   const excalidrawApiRef = useRef<any>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const layout = useMemo(() => buildLayout(model), [model]);
+  const layout = useMemo(
+    () => buildLayout(model, layoutSeed),
+    [model, layoutSeed],
+  );
 
-  const initialData = useMemo(() => {
-    const elements = buildElements(layout);
-    return {
-      elements,
+  const initialData = useMemo(
+    () => ({
+      elements: buildElements(layout),
       appState: {
         viewBackgroundColor: "#f8fafc",
         theme: "light" as const,
         currentItemRoughness: 0,
-        zoom: { value: 0.8 },
-        scrollX: 0,
-        scrollY: 0,
+        zoom: { value: 0.75 as const },
       },
       scrollToContent: true,
-    };
-  }, [layout]);
+    }),
+    [layout],
+  );
 
   const handleGenerate = () => {
-    try {
-      const parsed = parseSqlSchema(sql);
-      if (!parsed.entities.length) {
-        setError("No CREATE TABLE statements found. Please check your SQL.");
-        return;
+    setGenerating(true);
+    setTimeout(() => {
+      try {
+        const parsed = parseSqlSchema(sql);
+        if (!parsed.entities.length) {
+          setError("No CREATE TABLE statements found. Please check your SQL.");
+          setGenerating(false);
+          return;
+        }
+        // New random seed every time → different layout arrangement
+        const newSeed = Math.floor(Math.random() * 0xffffff);
+        setModel(parsed);
+        setLayoutSeed(newSeed);
+        setExcalidrawKey((k) => k + 1);
+        setError("");
+      } catch (e: any) {
+        setError("Parse error: " + e.message);
       }
-      setModel(parsed);
-      setKey((k) => k + 1);
-      setError("");
-    } catch (e: any) {
-      setError("Parse error: " + e.message);
-    }
+      setGenerating(false);
+    }, 80);
   };
 
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const text = await file.text();
-    setSql(text);
+    setSql(await file.text());
     e.target.value = "";
   };
 
@@ -926,7 +851,7 @@ export default function ERDiagramPage() {
       appState: {
         ...api.getAppState(),
         exportWithDarkMode: false,
-        viewBackgroundColor: "#f8fafc",
+        viewBackgroundColor: "#ffffff",
       },
     };
   };
@@ -941,309 +866,281 @@ export default function ERDiagramPage() {
         exportPadding: 32,
         exportBackground: true,
       });
-      const blob = new Blob([new XMLSerializer().serializeToString(svg)], {
-        type: "image/svg+xml",
-      });
-      download(blob, "erd.svg");
+      dl(
+        new Blob([new XMLSerializer().serializeToString(svg)], {
+          type: "image/svg+xml",
+        }),
+        "erd.svg",
+      );
     } else {
-      const blob = await mod.exportToBlob({
-        ...snap,
-        format,
-        exportPadding: 32,
-        exportBackground: true,
-      });
-      download(blob, `erd.${format}`);
+      dl(
+        await mod.exportToBlob({
+          ...snap,
+          format,
+          exportPadding: 32,
+          exportBackground: true,
+        }),
+        `erd.${format}`,
+      );
     }
   };
 
-  const download = (blob: Blob, name: string) => {
+  const dl = (blob: Blob, name: string) => {
     const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = name;
-    a.click();
+    Object.assign(document.createElement("a"), {
+      href: url,
+      download: name,
+    }).click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
+  const tableCount = model.entities.length;
+  const colCount = model.entities.reduce((s, e) => s + e.attributes.length, 0);
+  const relCount = model.entities.reduce(
+    (s, e) =>
+      s + e.attributes.filter((a) => a.isForeign && a.references).length,
+    0,
+  );
+
+  const PANEL_W = 440;
+
   return (
-    <main
-      style={{
-        height: "100vh",
-        width: "100vw",
-        background: "#f1f5f9",
-        fontFamily: "system-ui, sans-serif",
-        overflow: "hidden",
-        position: "relative",
-      }}
-    >
-      {/* Top-left title */}
-      <div
-        style={{
-          position: "absolute",
-          top: 12,
-          left: 12,
-          zIndex: 30,
-          background: "white",
-          border: "1px solid #cbd5e1",
-          borderRadius: 10,
-          padding: "6px 14px",
-          boxShadow: "0 1px 4px rgba(0,0,0,0.08)",
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-        }}
-      >
-        <span style={{ fontSize: 13, fontWeight: 700, color: "#0f172a" }}>
-          ⬡ SQL ER Diagram
-        </span>
-      </div>
+    <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-gray-50 font-sans text-gray-900">
+      {/* ── Top bar ─────────────────────────────────────────────────────── */}
+      <header className="relative z-30 flex h-13 shrink-0 items-center justify-between border-b border-gray-200 bg-white px-4 shadow-sm">
+        {/* Brand */}
+        <div className="flex items-center gap-3">
+          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-600 shadow shadow-blue-200">
+            <svg
+              viewBox="0 0 16 16"
+              fill="none"
+              className="h-4 w-4"
+              stroke="white"
+              strokeWidth="1.7"
+            >
+              <rect x="1.5" y="3.5" width="5" height="4" rx="0.75" />
+              <rect x="9.5" y="8.5" width="5" height="4" rx="0.75" />
+              <path d="M6.5 5.5h3v5h-3" strokeLinejoin="round" />
+            </svg>
+          </div>
+          <div className="flex flex-col leading-tight">
+            <span className="text-sm font-bold tracking-tight text-gray-900">
+              SQL <span className="text-blue-600">ERD</span>
+            </span>
+            <span className="hidden text-[10px] font-medium text-gray-400 sm:block">
+              Entity Relationship Diagram
+            </span>
+          </div>
 
-      {/* Top-right toolbar */}
-      <div
-        style={{
-          position: "absolute",
-          top: 12,
-          right: 12,
-          zIndex: 30,
-          background: "white",
-          border: "1px solid #cbd5e1",
-          borderRadius: 10,
-          padding: "6px 10px",
-          boxShadow: "0 1px 4px rgba(0,0,0,0.08)",
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-        }}
-      >
-        <button
-          onClick={() => setPanelOpen((v) => !v)}
-          style={btnStyle("#f8fafc", "#334155")}
-        >
-          {panelOpen ? "← Hide SQL" : "Show SQL →"}
-        </button>
-        <button
-          onClick={handleGenerate}
-          style={btnStyle("#1d4ed8", "white", true)}
-        >
-          ⚡ Generate
-        </button>
-        <div style={{ width: 1, height: 22, background: "#e2e8f0" }} />
-        <button
-          onClick={() => exportAs("png")}
-          style={btnStyle("#f8fafc", "#334155")}
-        >
-          PNG
-        </button>
-        <button
-          onClick={() => exportAs("jpg")}
-          style={btnStyle("#f8fafc", "#334155")}
-        >
-          JPG
-        </button>
-        <button
-          onClick={() => exportAs("svg")}
-          style={btnStyle("#f8fafc", "#334155")}
-        >
-          SVG
-        </button>
-      </div>
-
-      {/* SQL Panel */}
-      <aside
-        style={{
-          position: "absolute",
-          top: 56,
-          right: 12,
-          zIndex: 20,
-          width: 480,
-          height: "calc(100vh - 72px)",
-          background: "white",
-          border: "1px solid #cbd5e1",
-          borderRadius: 12,
-          boxShadow: "0 4px 24px rgba(0,0,0,0.10)",
-          display: "flex",
-          flexDirection: "column",
-          gap: 0,
-          transition: "transform 0.25s cubic-bezier(.4,0,.2,1)",
-          transform: panelOpen ? "translateX(0)" : "translateX(520px)",
-          overflow: "hidden",
-        }}
-      >
-        {/* Panel header */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            padding: "10px 14px 8px",
-            borderBottom: "1px solid #e2e8f0",
-            background: "#f8fafc",
-          }}
-        >
-          <span style={{ fontSize: 13, fontWeight: 600, color: "#1e293b" }}>
-            SQL Schema
-          </span>
-          <label
-            style={{
-              ...btnStyle("#f1f5f9", "#334155"),
-              cursor: "pointer",
-              fontSize: 12,
-            }}
-          >
-            📂 Import
-            <input
-              type="file"
-              accept=".sql,.txt"
-              onChange={handleImport}
-              style={{ display: "none" }}
-            />
-          </label>
+          {/* Stats */}
+          <div className="ml-4 hidden items-center divide-x divide-gray-200 rounded-lg border border-gray-200 bg-gray-50 sm:flex">
+            {[
+              { n: tableCount, label: "tables" },
+              { n: colCount, label: "columns" },
+              { n: relCount, label: "relations" },
+            ].map(({ n, label }) => (
+              <div
+                key={label}
+                className="flex items-baseline gap-1 px-3 py-1.5"
+              >
+                <span className="text-sm font-bold text-blue-600 tabular-nums">
+                  {n}
+                </span>
+                <span className="text-xs text-gray-400">{label}</span>
+              </div>
+            ))}
+          </div>
         </div>
 
-        {/* Textarea */}
-        <div style={{ flex: 1, overflow: "hidden", position: "relative" }}>
-          <textarea
-            ref={textareaRef}
-            value={sql}
-            onChange={(e) => setSql(e.target.value)}
-            spellCheck={false}
-            style={{
-              width: "100%",
-              height: "100%",
-              padding: "12px 14px",
-              fontFamily: '"Fira Code", "Cascadia Code", "Consolas", monospace',
-              fontSize: 13,
-              lineHeight: 1.6,
-              border: "none",
-              outline: "none",
-              resize: "none",
-              background: "#fafafa",
-              color: "#1e293b",
-              boxSizing: "border-box",
+        {/* Actions */}
+        <div className="flex items-center gap-2">
+          {/* Toggle panel */}
+          <button
+            onClick={() => setPanelOpen((v) => !v)}
+            className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs font-medium text-gray-600 shadow-sm transition hover:border-gray-300 hover:bg-gray-50 hover:text-gray-900"
+          >
+            <svg
+              viewBox="0 0 14 10"
+              fill="none"
+              className="h-3.5 w-3.5"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+            >
+              <path d="M1 1h12M1 5h7M1 9h9" />
+            </svg>
+            {panelOpen ? "Hide SQL" : "Show SQL"}
+          </button>
+
+          {/* Generate */}
+          <button
+            onClick={handleGenerate}
+            disabled={generating}
+            className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white shadow shadow-blue-200 transition hover:bg-blue-700 active:scale-95 disabled:opacity-60"
+          >
+            {generating ? (
+              <svg
+                className="h-3.5 w-3.5 animate-spin"
+                viewBox="0 0 12 12"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+              >
+                <circle cx="6" cy="6" r="4" strokeOpacity="0.25" />
+                <path d="M6 2a4 4 0 0 1 4 4" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 10 12" fill="currentColor" className="h-3 w-3">
+                <polygon points="0,0 10,6 0,12" />
+              </svg>
+            )}
+            {generating ? "Generating…" : "Generate ERD"}
+          </button>
+
+          <div className="h-6 w-px bg-gray-200" />
+
+          {/* Export buttons */}
+          {(["png", "jpg", "svg"] as const).map((fmt) => (
+            <button
+              key={fmt}
+              onClick={() => exportAs(fmt)}
+              className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-[10px] font-semibold uppercase tracking-widest text-gray-500 shadow-sm transition hover:border-gray-300 hover:bg-gray-50 hover:text-gray-800"
+            >
+              {fmt}
+            </button>
+          ))}
+        </div>
+      </header>
+
+      {/* ── Body ─────────────────────────────────────────────────────────── */}
+      <div className="relative flex-1 overflow-hidden">
+        {/* Canvas — positioned absolutely so closing the panel truly gives it 100% width */}
+        <div
+          className="absolute inset-0 transition-all duration-300"
+          style={{ right: panelOpen ? PANEL_W : 0 }}
+        >
+          <Excalidraw
+            key={excalidrawKey}
+            initialData={initialData}
+            excalidrawAPI={(api: any) => {
+              excalidrawApiRef.current = api;
+            }}
+            UIOptions={{
+              canvasActions: {
+                changeViewBackgroundColor: false,
+                toggleTheme: false,
+                saveToActiveFile: false,
+                loadScene: false,
+                export: false,
+              },
             }}
           />
         </div>
 
-        {/* Legend */}
-        <div
+        {/* SQL Side Panel — absolute on the right, slides in/out */}
+        <aside
+          className="absolute inset-y-0 right-0 z-20 flex flex-col border-l border-gray-200 bg-white shadow-xl transition-transform duration-300"
           style={{
-            padding: "8px 14px",
-            borderTop: "1px solid #e2e8f0",
-            background: "#f8fafc",
-            display: "flex",
-            gap: 16,
-            flexWrap: "wrap",
+            width: PANEL_W,
+            transform: panelOpen ? "translateX(0)" : `translateX(${PANEL_W}px)`,
           }}
         >
-          {[
-            { color: "#bfdbfe", label: "Entity (Table)" },
-            { color: "#fef3c7", label: "PK Attribute" },
-            { color: "#dcfce7", label: "FK Attribute" },
-            { color: "#f8fafc", label: "Attribute" },
-            { color: "#fef9c3", label: "Relationship" },
-          ].map(({ color, label }) => (
-            <div
-              key={label}
-              style={{ display: "flex", alignItems: "center", gap: 5 }}
-            >
-              <div
-                style={{
-                  width: 12,
-                  height: 12,
-                  background: color,
-                  border: "1px solid #94a3b8",
-                  borderRadius: 2,
-                }}
-              />
-              <span style={{ fontSize: 11, color: "#64748b" }}>{label}</span>
+          {/* Panel header */}
+          <div className="flex shrink-0 items-center justify-between border-b border-gray-100 bg-gray-50 px-4 py-3">
+            <div className="flex items-center gap-2">
+              <div className="h-2 w-2 rounded-full bg-emerald-500" />
+              <span className="text-xs font-semibold uppercase tracking-widest text-gray-500">
+                SQL Schema
+              </span>
             </div>
-          ))}
-        </div>
+            <label className="flex cursor-pointer items-center gap-1.5 rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-xs font-medium text-gray-600 shadow-sm transition hover:bg-gray-50 hover:text-gray-900">
+              <svg
+                viewBox="0 0 14 14"
+                fill="none"
+                className="h-3.5 w-3.5"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M7 1v8M4 6l3 3 3-3" />
+                <path d="M2 11h10" />
+              </svg>
+              Import .sql
+              <input
+                type="file"
+                accept=".sql,.txt"
+                onChange={handleImport}
+                className="hidden"
+              />
+            </label>
+          </div>
 
-        {/* Generate button */}
-        <div
-          style={{
-            padding: "10px 14px",
-            borderTop: "1px solid #e2e8f0",
-            background: "#f8fafc",
-          }}
-        >
-          <button
-            onClick={handleGenerate}
-            style={{
-              ...btnStyle("#1d4ed8", "white", true),
-              width: "100%",
-              justifyContent: "center",
-              fontSize: 13,
-            }}
-          >
-            ⚡ Generate ER Diagram
-          </button>
-        </div>
-      </aside>
+          {/* Textarea */}
+          <textarea
+            value={sql}
+            onChange={(e) => setSql(e.target.value)}
+            spellCheck={false}
+            className="flex-1 resize-none bg-white p-4 font-mono text-[12.5px] leading-relaxed text-gray-800 outline-none placeholder-gray-300 selection:bg-blue-100"
+            placeholder="-- Paste your CREATE TABLE statements here…"
+          />
 
-      {/* Error toast */}
+          {/* Legend */}
+          <div className="shrink-0 border-t border-gray-100 bg-gray-50 px-4 py-3">
+            <p className="mb-2 text-[9px] font-bold uppercase tracking-widest text-gray-400">
+              Legend
+            </p>
+            <div className="flex flex-wrap gap-x-4 gap-y-1.5">
+              {LEGEND.map(({ color, label }) => (
+                <div key={label} className="flex items-center gap-1.5">
+                  <div
+                    className={`h-3 w-3 shrink-0 rounded-sm border ${color}`}
+                  />
+                  <span className="text-[11px] text-gray-500">{label}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Generate CTA */}
+          <div className="shrink-0 border-t border-gray-100 p-3">
+            <button
+              onClick={handleGenerate}
+              disabled={generating}
+              className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 py-2.5 text-sm font-semibold text-white shadow shadow-blue-200 transition hover:bg-blue-700 disabled:opacity-60"
+            >
+              {generating ? (
+                <>
+                  <svg
+                    className="h-4 w-4 animate-spin"
+                    viewBox="0 0 12 12"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                  >
+                    <circle cx="6" cy="6" r="4" strokeOpacity="0.25" />
+                    <path d="M6 2a4 4 0 0 1 4 4" />
+                  </svg>
+                  Generating…
+                </>
+              ) : (
+                "⚡ Generate ER Diagram"
+              )}
+            </button>
+            <p className="mt-2 text-center text-[10px] text-gray-400">
+              Each click randomizes the layout arrangement
+            </p>
+          </div>
+        </aside>
+      </div>
+
+      {/* ── Error Toast ──────────────────────────────────────────────────── */}
       {error && (
-        <div
-          style={{
-            position: "absolute",
-            bottom: 20,
-            left: "50%",
-            transform: "translateX(-50%)",
-            zIndex: 40,
-            background: "#fef2f2",
-            border: "1px solid #fca5a5",
-            borderRadius: 8,
-            padding: "8px 16px",
-            color: "#991b1b",
-            fontSize: 13,
-            boxShadow: "0 2px 8px rgba(0,0,0,0.1)",
-          }}
-        >
-          ⚠️ {error}
+        <div className="absolute bottom-6 left-1/2 z-50 -translate-x-1/2 whitespace-nowrap rounded-xl border border-red-200 bg-white px-5 py-3 text-xs font-medium text-red-600 shadow-xl">
+          <span className="mr-1.5">⚠</span>
+          {error}
         </div>
       )}
-
-      {/* Canvas */}
-      <div style={{ width: "100%", height: "100%" }}>
-        <Excalidraw
-          key={key}
-          initialData={initialData}
-          excalidrawAPI={(api: any) => {
-            excalidrawApiRef.current = api;
-          }}
-          UIOptions={{
-            canvasActions: {
-              changeViewBackgroundColor: false,
-              toggleTheme: false,
-              saveToActiveFile: false,
-              loadScene: false,
-              export: false,
-            },
-          }}
-        />
-      </div>
-    </main>
+    </div>
   );
-}
-
-function btnStyle(
-  bg: string,
-  color: string,
-  primary?: boolean,
-): React.CSSProperties {
-  return {
-    background: bg,
-    color,
-    border: primary ? "none" : "1px solid #e2e8f0",
-    borderRadius: 7,
-    padding: "5px 12px",
-    fontSize: 12,
-    fontWeight: primary ? 600 : 500,
-    cursor: "pointer",
-    display: "flex",
-    alignItems: "center",
-    gap: 4,
-    boxShadow: primary ? "0 1px 3px rgba(29,78,216,0.3)" : undefined,
-  };
 }
