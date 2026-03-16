@@ -330,51 +330,177 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
 
   const ENT_W = 200,
     ENT_H = 70;
-  const ATT_RX = 72,
-    ATT_RY = 26;
-  // How far attribute centres sit from entity centre
-  const ATTR_ORBIT = 195;
-  // Safe clearance radius around an entity (entity half-diagonal + orbit + attr half-width)
-  const SAFE_R = ATTR_ORBIT + ATT_RX + 20;
+  const ATT_RX = 68,
+    ATT_RY = 24;
+  // Min arc gap between adjacent attribute ellipses on the ring
+  const MIN_ARC_GAP = 20;
 
-  // Grid cell must be wide/tall enough that adjacent rings don't overlap
-  const CELL_W = SAFE_R * 2 + 200;
-  const CELL_H = SAFE_R * 2 + 200;
-  const PAD = 350;
-
-  const n = model.entities.length;
-  const baseCols = Math.max(1, Math.ceil(Math.sqrt(n)));
-  // Slightly prefer wider layouts for readability
-  const cols = Math.min(n, baseCols + (rng() > 0.6 ? 1 : 0));
-  const rows = Math.ceil(n / cols);
-
-  const canvasW = Math.max(2200, cols * CELL_W + PAD * 2);
-  const canvasH = Math.max(1400, rows * CELL_H + PAD * 2);
-
-  // Fisher-Yates shuffle of slot indices
-  const indices = Array.from({ length: n }, (_, i) => i);
-  for (let i = n - 1; i > 0; i--) {
-    const j = Math.floor(rng() * (i + 1));
-    [indices[i], indices[j]] = [indices[j]!, indices[i]!];
+  // Compute the orbit radius needed for a given attribute count so ellipses don't crowd
+  function orbitForCount(count: number): number {
+    if (count <= 1) return 160;
+    // Circumference must fit count*(ellipseWidth + gap)
+    const minCircumference = count * (ATT_RX * 2 + MIN_ARC_GAP);
+    const minR = minCircumference / (2 * Math.PI);
+    return Math.max(160, minR);
   }
 
-  // ---- helpers ----
+  // Safe clearance radius: from entity centre to outer edge of attribute ring + padding
+  function safeRForCount(count: number): number {
+    return orbitForCount(count) + ATT_RX + 24;
+  }
 
+  // Cell size must accommodate the largest possible entity in that row/col.
+  // We compute per-entity safe radii and use the max for grid sizing.
+  const entitySafeR = model.entities.map((e) =>
+    safeRForCount(e.attributes.length),
+  );
+  const maxSafeR = Math.max(...entitySafeR, 200);
+  const CELL_W = maxSafeR * 2 + 160;
+  const CELL_H = maxSafeR * 2 + 160;
+  const PAD = 360;
+  const n = model.entities.length;
+
+  // Step 1: adjacency weights
+  const adjMap = new Map<string, number>();
+  const relDegree = new Map<string, number>();
+  for (const ent of model.entities) {
+    const srcName = getShortName(ent.name).toLowerCase();
+    for (const attr of ent.attributes) {
+      if (!attr.isForeign || !attr.references) continue;
+      const tgtName = getShortName(attr.references).toLowerCase();
+      if (tgtName === srcName) continue;
+      const edgeKey = [srcName, tgtName].sort().join(":");
+      adjMap.set(edgeKey, (adjMap.get(edgeKey) ?? 0) + 1);
+      relDegree.set(srcName, (relDegree.get(srcName) ?? 0) + 1);
+      relDegree.set(tgtName, (relDegree.get(tgtName) ?? 0) + 1);
+    }
+  }
+
+  // Step 2: sort entities by degree desc (most connected -> centre)
+  const sortedEntities = [...model.entities].sort((a, b) => {
+    const da = relDegree.get(getShortName(a.name).toLowerCase()) ?? 0;
+    const db = relDegree.get(getShortName(b.name).toLowerCase()) ?? 0;
+    return db - da;
+  });
+
+  const cols = Math.max(1, Math.ceil(Math.sqrt(n)));
+  const rows = Math.ceil(n / cols);
+  const canvasW = Math.max(2600, cols * CELL_W + PAD * 2);
+  const canvasH = Math.max(1800, rows * CELL_H + PAD * 2);
+
+  // BFS spiral from centre outward
+  function spiralSlots(
+    numCols: number,
+    numRows: number,
+  ): Array<[number, number]> {
+    const slots: Array<[number, number]> = [];
+    const visited = new Set<string>();
+    const cCol = Math.floor(numCols / 2),
+      cRow = Math.floor(numRows / 2);
+    const queue: Array<[number, number]> = [[cCol, cRow]];
+    visited.add(cCol + "," + cRow);
+    while (queue.length > 0) {
+      const item = queue.shift()!;
+      const c = item[0],
+        r = item[1];
+      if (c >= 0 && c < numCols && r >= 0 && r < numRows) slots.push([c, r]);
+      const nb: Array<[number, number]> = [
+        [0, -1],
+        [1, 0],
+        [0, 1],
+        [-1, 0],
+        [1, -1],
+        [1, 1],
+        [-1, 1],
+        [-1, -1],
+      ];
+      for (const d of nb) {
+        const nc = c + d[0],
+          nr = r + d[1];
+        const k = nc + "," + nr;
+        if (
+          !visited.has(k) &&
+          nc >= 0 &&
+          nc < numCols &&
+          nr >= 0 &&
+          nr < numRows
+        ) {
+          visited.add(k);
+          queue.push([nc, nr]);
+        }
+      }
+    }
+    return slots;
+  }
+
+  const slots = spiralSlots(cols, rows);
+
+  // Greedy placement: pick free slot that maximises adjacency score with placed neighbors
+  const slotAssignment = new Map<string, [number, number]>();
+  const usedSlots = new Set<string>();
+
+  for (const ent of sortedEntities) {
+    const entName = getShortName(ent.name).toLowerCase();
+    let bestSlot: [number, number] = slots.find(
+      (s) => !usedSlots.has(s[0] + "," + s[1]),
+    ) ?? [0, 0];
+    let bestScore = -Infinity;
+
+    for (const slot of slots) {
+      const c = slot[0],
+        r = slot[1];
+      if (usedSlots.has(c + "," + r)) continue;
+      let score = 0;
+      const deltas: Array<[number, number]> = [
+        [-1, 0],
+        [1, 0],
+        [0, -1],
+        [0, 1],
+        [-1, -1],
+        [1, -1],
+        [-1, 1],
+        [1, 1],
+      ];
+      for (const d of deltas) {
+        const nc = c + d[0],
+          nr = r + d[1];
+        for (const [placedName, placed] of slotAssignment) {
+          if (placed[0] === nc && placed[1] === nr) {
+            const edgeKey = [entName, placedName].sort().join(":");
+            const w = adjMap.get(edgeKey) ?? 0;
+            const isDiag = Math.abs(d[0]) === 1 && Math.abs(d[1]) === 1;
+            score += isDiag ? w * 0.5 : w;
+          }
+        }
+      }
+      const slotIdx = slots.findIndex((s) => s[0] === c && s[1] === r);
+      if (score - slotIdx * 0.01 > bestScore) {
+        bestScore = score - slotIdx * 0.01;
+        bestSlot = [c, r];
+      }
+    }
+
+    slotAssignment.set(entName, bestSlot);
+    usedSlots.add(bestSlot[0] + "," + bestSlot[1]);
+  }
+
+  // Build attribute ring with per-entity adaptive orbit radius
   function buildRing(
     ent: LayoutEntity,
     modelEnt: DiagramEntity,
     startAngle: number,
   ): LayoutAttribute[] {
     const count = modelEnt.attributes.length;
+    const orbit = orbitForCount(count);
     return modelEnt.attributes.map((attr, j) => {
       const angle =
         count === 1 ? -Math.PI / 2 : startAngle + (2 * Math.PI * j) / count;
-      const ax = ent.cx + ATTR_ORBIT * Math.cos(angle);
-      const ay = ent.cy + ATTR_ORBIT * Math.sin(angle);
+      const ax = ent.cx + orbit * Math.cos(angle);
+      const ay = ent.cy + orbit * Math.sin(angle);
       const lineStart = rectEdgePoint(ent, { x: ax, y: ay });
       const lineEnd = ellipseEdgePoint(ax, ay, ATT_RX, ATT_RY, lineStart);
       return {
-        id: `${ent.id}-attr-${attr.name.toLowerCase().replace(/\W+/g, "_")}`,
+        id: ent.id + "-attr-" + attr.name.toLowerCase().replace(/\W+/g, "_"),
         x: ax,
         y: ay,
         rx: ATT_RX,
@@ -391,7 +517,7 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
     });
   }
 
-  // Exact parametric line-vs-ellipse hit test (padded)
+  // Exact parametric segment vs padded-ellipse hit test
   function segHitsEllipse(
     ax: number,
     ay: number,
@@ -401,7 +527,7 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
     ey: number,
     erx: number,
     ery: number,
-    pad = 12,
+    pad: number = 12,
   ): boolean {
     const rx2 = erx + pad,
       ry2 = ery + pad;
@@ -418,21 +544,20 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
     const disc = b2 * b2 - a * c;
     if (disc < 0) return false;
     const sq = Math.sqrt(disc);
-    const t1 = (-b2 - sq) / a;
-    const t2 = (-b2 + sq) / a;
+    const t1 = (-b2 - sq) / a,
+      t2 = (-b2 + sq) / a;
     return (t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1) || (t1 < 0 && t2 > 1);
   }
 
-  // Is a point inside the "safe zone" of an entity (entity rect + attr ring)?
   function pointInsideSafeZone(
     px: number,
     py: number,
     ent: LayoutEntity,
+    entAttrCount: number,
   ): boolean {
-    return Math.hypot(px - ent.cx, py - ent.cy) < SAFE_R;
+    return Math.hypot(px - ent.cx, py - ent.cy) < safeRForCount(entAttrCount);
   }
 
-  // Count total attribute ellipse crossings for a segment across ALL entities
   function segCrossings(
     ax: number,
     ay: number,
@@ -449,16 +574,14 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
     return hits;
   }
 
-  // ---- place entities ----
-  const entities: LayoutEntity[] = model.entities.map((ent, originalIdx) => {
-    const slot = indices.indexOf(originalIdx);
-    const col = slot % cols;
-    const row = Math.floor(slot / cols);
-    // No jitter — grid alignment makes diamond placement more predictable
-    const cx = PAD + col * CELL_W + CELL_W / 2;
-    const cy = PAD + row * CELL_H + CELL_H / 2;
+  // Step 3: place entities
+  const entities: LayoutEntity[] = model.entities.map((ent) => {
+    const entName = getShortName(ent.name).toLowerCase();
+    const assigned = slotAssignment.get(entName) ?? [0, 0];
+    const cx = PAD + assigned[0] * CELL_W + CELL_W / 2;
+    const cy = PAD + assigned[1] * CELL_H + CELL_H / 2;
     const entity: LayoutEntity = {
-      id: `ent-${ent.name.toLowerCase().replace(/\W+/g, "_")}`,
+      id: "ent-" + ent.name.toLowerCase().replace(/\W+/g, "_"),
       name: getShortName(ent.name),
       x: cx - ENT_W / 2,
       y: cy - ENT_H / 2,
@@ -468,12 +591,20 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
       cy,
       attributes: [],
     };
-    // Initial ring at random angle; will be optimised below
     entity.attributes = buildRing(entity, ent, rng() * Math.PI * 2);
     return entity;
   });
 
-  // Build full relationship list
+  // Attribute count lookup for safe zone checks
+  const attrCountMap = new Map<string, number>();
+  for (const ent of model.entities) {
+    attrCountMap.set(
+      "ent-" + ent.name.toLowerCase().replace(/\W+/g, "_"),
+      ent.attributes.length,
+    );
+  }
+
+  // Build relationship list
   type RelInfo = { srcId: string; tgtId: string };
   const rels: RelInfo[] = [];
   for (const ent of entities) {
@@ -488,167 +619,129 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
     }
   }
 
-  // ---- Pass 1: optimise each entity's ring rotation ----
-  // For each entity involved in rels, rotate its attribute ring so the
-  // relationship lines that pass through its space miss its attributes.
-  // Diamond tentative position = point on the axis between the two entities,
-  // just outside THIS entity's safe zone (so the segment from entity-edge to
-  // that point is short and provably stays inside the inter-entity corridor).
-
-  const ANGLE_STEPS = 90; // 4-degree resolution
-
+  // Pass 1: rotate ring to minimise crossings with relationship lines
+  const ANGLE_STEPS = 90;
   for (const ent of entities) {
     const modelEnt = model.entities.find(
       (e) => getShortName(e.name) === ent.name,
     )!;
     if (!modelEnt) continue;
-
     const myRels = rels.filter((r) => r.srcId === ent.id || r.tgtId === ent.id);
     if (myRels.length === 0) continue;
 
+    const mySafeR = safeRForCount(modelEnt.attributes.length);
     let bestAngle = 0,
       bestHits = Infinity;
 
     for (let step = 0; step < ANGLE_STEPS; step++) {
       const angle = (step / ANGLE_STEPS) * Math.PI * 2;
       const ring = buildRing(ent, modelEnt, angle);
-
       let hits = 0;
       for (const rel of myRels) {
         const src = entities.find((e) => e.id === rel.srcId)!;
         const tgt = entities.find((e) => e.id === rel.tgtId)!;
         if (!src || !tgt) continue;
-
-        // Tentative diamond: along the axis, just past this entity's safe zone
         const axDx = tgt.cx - src.cx,
           axDy = tgt.cy - src.cy;
         const axLen = Math.hypot(axDx, axDy) || 1;
-        // From the current entity centre, step out SAFE_R + 30 toward the other entity
         const isSource = ent.id === src.id;
-        const baseCx = isSource ? src.cx : tgt.cx;
-        const dirMul = isSource ? 1 : -1;
-        const tentDmx = baseCx + (axDx / axLen) * dirMul * (SAFE_R + 30);
-        const tentDmy =
+        const bx =
+          (isSource ? src.cx : tgt.cx) +
+          (axDx / axLen) * (isSource ? 1 : -1) * (mySafeR + 30);
+        const by =
           (isSource ? src.cy : tgt.cy) +
-          (axDy / axLen) * dirMul * (SAFE_R + 30);
-
-        const entEdge = rectEdgePoint(ent, { x: tentDmx, y: tentDmy });
+          (axDy / axLen) * (isSource ? 1 : -1) * (mySafeR + 30);
+        const entEdge = rectEdgePoint(ent, { x: bx, y: by });
         for (const a of ring) {
           if (
-            segHitsEllipse(
-              entEdge.x,
-              entEdge.y,
-              tentDmx,
-              tentDmy,
-              a.x,
-              a.y,
-              a.rx,
-              a.ry,
-            )
+            segHitsEllipse(entEdge.x, entEdge.y, bx, by, a.x, a.y, a.rx, a.ry)
           )
             hits++;
         }
       }
-
       if (hits < bestHits) {
         bestHits = hits;
         bestAngle = angle;
         if (bestHits === 0) break;
       }
     }
-
     ent.attributes = buildRing(ent, modelEnt, bestAngle);
   }
 
-  // ---- Pass 2: find best diamond position for each relationship ----
-  // The diamond must be:
-  //   a) outside the safe zone of BOTH entities
-  //   b) the two line segments (srcEdge->diamond, diamond->tgtEdge) cross
-  //      the fewest possible attribute ellipses
-  //   c) not inside any other entity's safe zone if possible
-
+  // Pass 2: optimal diamond placement
   const diamondPositions = new Map<string, Point>();
-
   for (const rel of rels) {
     const src = entities.find((e) => e.id === rel.srcId)!;
     const tgt = entities.find((e) => e.id === rel.tgtId)!;
     if (!src || !tgt) continue;
 
-    const key = `${rel.srcId}:${rel.tgtId}`;
+    const srcCount = attrCountMap.get(src.id) ?? 0;
+    const tgtCount = attrCountMap.get(tgt.id) ?? 0;
+    const srcSafeR = safeRForCount(srcCount);
+    const tgtSafeR = safeRForCount(tgtCount);
 
-    const axDx = tgt.cx - src.cx;
-    const axDy = tgt.cy - src.cy;
+    const key = rel.srcId + ":" + rel.tgtId;
+    const axDx = tgt.cx - src.cx,
+      axDy = tgt.cy - src.cy;
     const axLen = Math.hypot(axDx, axDy) || 1;
     const ux = axDx / axLen,
-      uy = axDy / axLen; // unit vector src->tgt
-    const px = -uy,
-      py = ux; // perpendicular
+      uy = axDy / axLen;
+    const perpX = -uy,
+      perpY = ux;
+    const midX = (src.cx + tgt.cx) / 2,
+      midY = (src.cy + tgt.cy) / 2;
 
-    // Midpoint between the two entity centres
-    const midX = (src.cx + tgt.cx) / 2;
-    const midY = (src.cy + tgt.cy) / 2;
+    // Axis corridor: from just outside src's safe zone to just outside tgt's safe zone
+    const axStartX = src.cx + ux * (srcSafeR + 10),
+      axStartY = src.cy + uy * (srcSafeR + 10);
+    const axEndX = tgt.cx - ux * (tgtSafeR + 10),
+      axEndY = tgt.cy - uy * (tgtSafeR + 10);
 
-    // Build a dense candidate grid:
-    // - Along the axis: from just outside src's safe zone to just outside tgt's safe zone
-    // - Perpendicular: ±0, ±60, ±120, ±200, ±300
     const candidates: Point[] = [];
-
-    const axSteps = 9; // how many points along the axis
-    for (let ai = 0; ai <= axSteps; ai++) {
-      const t = ai / axSteps;
-      // Parametric position along axis: start = src.cx + SAFE_R*ux, end = tgt.cx - SAFE_R*ux
-      const axStartX = src.cx + ux * (SAFE_R + 10);
-      const axStartY = src.cy + uy * (SAFE_R + 10);
-      const axEndX = tgt.cx - ux * (SAFE_R + 10);
-      const axEndY = tgt.cy - uy * (SAFE_R + 10);
+    // Dense grid along axis + perpendicular offsets
+    for (let ai = 0; ai <= 12; ai++) {
+      const t = ai / 12;
       const bx = axStartX + (axEndX - axStartX) * t;
       const by = axStartY + (axEndY - axStartY) * t;
-
-      for (const perpDist of [0, 60, 120, 180, 260, 360]) {
-        for (const sign of perpDist === 0 ? [0] : [1, -1]) {
-          candidates.push({
-            x: bx + px * perpDist * sign,
-            y: by + py * perpDist * sign,
-          });
+      for (const d of [0, 40, 80, 130, 190, 260, 350, 450]) {
+        for (const s of d === 0 ? [0] : [1, -1]) {
+          candidates.push({ x: bx + perpX * d * s, y: by + perpY * d * s });
         }
       }
     }
-
-    // Also add pure perpendicular offsets from midpoint at larger distances
-    for (const perpDist of [80, 160, 240, 320, 420]) {
-      for (const sign of [1, -1]) {
-        candidates.push({
-          x: midX + px * perpDist * sign,
-          y: midY + py * perpDist * sign,
-        });
+    // Extra wide perpendicular sweeps from midpoint
+    for (const d of [60, 120, 200, 300, 420]) {
+      for (const s of [1, -1]) {
+        candidates.push({ x: midX + perpX * d * s, y: midY + perpY * d * s });
+        // Also offset 1/3 and 2/3 along axis
+        const ax3X = axStartX + (axEndX - axStartX) / 3;
+        const ax3Y = axStartY + (axEndY - axStartY) / 3;
+        const ax23X = axStartX + ((axEndX - axStartX) * 2) / 3;
+        const ax23Y = axStartY + ((axEndY - axStartY) * 2) / 3;
+        candidates.push({ x: ax3X + perpX * d * s, y: ax3Y + perpY * d * s });
+        candidates.push({ x: ax23X + perpX * d * s, y: ax23Y + perpY * d * s });
       }
     }
 
-    let bestPos = candidates[0] ?? { x: midX, y: midY };
-    let bestScore = Infinity;
-
+    let bestPos = { x: midX, y: midY },
+      bestScore = Infinity;
     for (const cand of candidates) {
-      // Skip if inside either entity's safe zone
-      if (pointInsideSafeZone(cand.x, cand.y, src)) continue;
-      if (pointInsideSafeZone(cand.x, cand.y, tgt)) continue;
+      // Must be outside BOTH entities' adaptive safe zones
+      if (pointInsideSafeZone(cand.x, cand.y, src, srcCount)) continue;
+      if (pointInsideSafeZone(cand.x, cand.y, tgt, tgtCount)) continue;
 
       const srcEdge = rectEdgePoint(src, cand);
       const tgtEdge = rectEdgePoint(tgt, cand);
-
       const hits =
         segCrossings(srcEdge.x, srcEdge.y, cand.x, cand.y, entities) +
         segCrossings(cand.x, cand.y, tgtEdge.x, tgtEdge.y, entities);
-
-      // Prefer: fewer hits > closer to midpoint
       const dist = Math.hypot(cand.x - midX, cand.y - midY);
       const score = hits * 10000 + dist;
-
       if (score < bestScore) {
         bestScore = score;
         bestPos = cand;
       }
     }
-
     diamondPositions.set(key, bestPos);
   }
 
