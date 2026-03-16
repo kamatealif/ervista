@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useMemo, useState, useCallback } from "react";
+import { useMemo, useState, useCallback, useRef } from "react";
 import { format as formatSql } from "sql-formatter";
 import Editor from "@monaco-editor/react";
 
@@ -740,9 +740,9 @@ function buildExcalidrawSkeleton(
 ): Record<string, unknown>[] {
   const skeleton: Record<string, unknown>[] = [];
 
-  const DIAMOND_WIDTH = 120;
+  const DIAMOND_WIDTH = 100;
   const DIAMOND_HEIGHT = 30;
-  const LINE_OFFSET = 50;
+  const DEFAULT_FONT_SIZE = 16;
 
   function getRelationshipType(
     sourceEntity: LayoutEntity,
@@ -809,7 +809,7 @@ function buildExcalidrawSkeleton(
     targetY: number,
   ): Point {
     const hw = DIAMOND_WIDTH / 2;
-    const hh = DIAMOND_WIDTH / 2;
+    const hh = DIAMOND_HEIGHT / 2;
     const cx = diamondX + hw;
     const cy = diamondY + hh;
     const dx = targetX - cx;
@@ -833,6 +833,39 @@ function buildExcalidrawSkeleton(
 
   const shapes: Record<string, unknown>[] = [];
   const arrows: Record<string, unknown>[] = [];
+  const texts: Record<string, unknown>[] = [];
+
+  function pushText(params: {
+    id: string;
+    x: number;
+    y: number;
+    text: string;
+    fontSize?: number;
+    width?: number;
+    center?: boolean;
+  }) {
+    const fontSize = params.fontSize ?? DEFAULT_FONT_SIZE;
+    const approxCharWidth = fontSize * 0.62;
+    const approxWidth = Math.max(
+      12,
+      params.width ?? Math.ceil(params.text.length * approxCharWidth),
+    );
+    const approxHeight = Math.max(14, Math.ceil(fontSize * 1.35));
+    const x = params.center ? params.x - approxWidth / 2 : params.x;
+    const y = params.center ? params.y - approxHeight / 2 : params.y;
+
+    texts.push({
+      id: params.id,
+      type: "text",
+      x,
+      y,
+      text: params.text,
+      fontSize,
+      width: approxWidth,
+      height: approxHeight,
+      roughness: 0,
+    });
+  }
 
   for (const entity of layout.entities) {
     shapes.push({
@@ -843,9 +876,15 @@ function buildExcalidrawSkeleton(
       width: entity.width,
       height: entity.height,
       roughness: 0,
-      label: {
-        text: entity.name,
-      },
+    });
+    pushText({
+      id: `${entity.id}-text`,
+      x: entity.centerX,
+      y: entity.centerY,
+      text: entity.name,
+      fontSize: 18,
+      width: entity.width - 24,
+      center: true,
     });
 
     for (const attribute of entity.attributes) {
@@ -857,9 +896,15 @@ function buildExcalidrawSkeleton(
         width: attribute.rx * 2,
         height: attribute.ry * 2,
         roughness: 0,
-        label: {
-          text: attribute.label,
-        },
+      });
+      pushText({
+        id: `${attribute.id}-text`,
+        x: attribute.x,
+        y: attribute.y,
+        text: attribute.label,
+        fontSize: 14,
+        width: attribute.rx * 2 - 20,
+        center: true,
       });
 
       if (attribute.isPrimary) {
@@ -913,62 +958,76 @@ function buildExcalidrawSkeleton(
         width: DIAMOND_WIDTH,
         height: DIAMOND_HEIGHT,
         roughness: 0,
-        label: {
-          text: relType,
-        },
       });
+      if (relType) {
+        pushText({
+          id: `rel-${entity.id}-${target.id}-text`,
+          x: midX - (DIAMOND_WIDTH / 2) + 10,
+          y: midY - 10,
+          text: relType,
+          fontSize: 14,
+          width: DIAMOND_WIDTH - 20,
+        });
+      }
 
       const entityCorner = getEntityCornerPoint(entity, midX, midY);
-      const dx1 = entityCorner.x < midX ? LINE_OFFSET : -LINE_OFFSET;
-      const startX = entityCorner.x + dx1;
-      const startY = entityCorner.y;
-      const endX = midX + (entityCorner.x < midX ? -DIAMOND_WIDTH / 2 - 5 : DIAMOND_WIDTH / 2 + 5);
-      const endY = midY;
+      const diamondEntry = getDiamondEdgePoint(
+        midX - DIAMOND_WIDTH / 2,
+        midY - DIAMOND_HEIGHT / 2,
+        entityCorner.x,
+        entityCorner.y,
+      );
       
       arrows.push({
-        type: "line",
-        x: startX,
-        y: startY,
+        type: "arrow",
+        x: entityCorner.x,
+        y: entityCorner.y,
         points: [
           [0, 0],
-          [endX - startX, endY - startY],
+          [diamondEntry.x - entityCorner.x, diamondEntry.y - entityCorner.y],
         ],
         roughness: 0,
         straight: true,
         startArrowhead: null,
         endArrowhead: null,
-        label: {
-          text: cardinality,
-        },
-        labelPosition: 0.5,
+      });
+      pushText({
+        id: `rel-${entity.id}-${target.id}-card-a`,
+        x: (entityCorner.x + diamondEntry.x) / 2 - 10,
+        y: (entityCorner.y + diamondEntry.y) / 2 - 10,
+        text: cardinality,
+        fontSize: 12,
       });
 
       const targetCorner = getEntityCornerPoint(target, midX, midY);
-      const dx2 = targetCorner.x < midX ? -LINE_OFFSET : LINE_OFFSET;
-      const startX2 = targetCorner.x + dx2;
-      const startY2 = targetCorner.y;
-      const endX2 = midX + (targetCorner.x < midX ? -DIAMOND_WIDTH / 2 - 5 : DIAMOND_WIDTH / 2 + 5);
-      const endY2 = midY;
+      const diamondExit = getDiamondEdgePoint(
+        midX - DIAMOND_WIDTH / 2,
+        midY - DIAMOND_HEIGHT / 2,
+        targetCorner.x,
+        targetCorner.y,
+      );
 
       arrows.push({
-        type: "line",
-        x: startX2,
-        y: startY2,
+        type: "arrow",
+        x: diamondExit.x,
+        y: diamondExit.y,
         points: [
           [0, 0],
-          [endX2 - startX2, endY2 - startY2],
+          [targetCorner.x - diamondExit.x, targetCorner.y - diamondExit.y],
         ],
         roughness: 0,
         straight: true,
         startArrowhead: null,
         endArrowhead: null,
-        label: {
-          text: getCardinalityTarget(entity, target, attribute),
-        },
-        labelPosition: 0.5,
+      });
+      pushText({
+        id: `rel-${entity.id}-${target.id}-card-b`,
+        x: (targetCorner.x + diamondExit.x) / 2 - 10,
+        y: (targetCorner.y + diamondExit.y) / 2 - 10,
+        text: getCardinalityTarget(entity, target, attribute),
+        fontSize: 12,
       });
     }
-  }
   }
 
   for (const entity of layout.entities) {
@@ -998,7 +1057,7 @@ function buildExcalidrawSkeleton(
     }
   }
 
-  skeleton.push(...shapes, ...arrows);
+  skeleton.push(...shapes, ...texts, ...arrows);
 
   return skeleton;
 }
@@ -1058,7 +1117,7 @@ export default function Home() {
 
     try {
       currentSql = formatSql(currentSql, { language: "sql", keywordCase: "upper" });
-    } catch (e) {
+    } catch {
     }
 
     setSchemaInput(currentSql);
@@ -1087,26 +1146,127 @@ export default function Home() {
     e.target.value = "";
   };
 
+  type ExcalidrawApiSnapshot = {
+    getSceneElements: () => unknown[];
+    getAppState: () => Record<string, unknown>;
+  };
+
+  const excalidrawApiRef = useRef<ExcalidrawApiSnapshot | null>(null);
+
+  const downloadBlob = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const getExportSnapshot = () => {
+    if (!excalidrawApiRef.current) return;
+    const elements = excalidrawApiRef.current.getSceneElements();
+    const appState = excalidrawApiRef.current.getAppState();
+    return {
+      elements,
+      appState: {
+        ...appState,
+        exportWithDarkMode: false,
+        viewBackgroundColor: "#ffffff",
+      },
+    };
+  };
+
+  const handleExportPng = async () => {
+    const snapshot = getExportSnapshot();
+    if (!snapshot) return;
+
+    const { exportToBlob } = await import("@excalidraw/excalidraw");
+    const blob = await exportToBlob({
+      elements: snapshot.elements,
+      appState: snapshot.appState,
+      format: "png",
+      exportPadding: 24,
+      exportBackground: true,
+    });
+
+    downloadBlob(blob, "erd-diagram.png");
+  };
+
+  const handleExportJpg = async () => {
+    const snapshot = getExportSnapshot();
+    if (!snapshot) return;
+
+    const { exportToBlob } = await import("@excalidraw/excalidraw");
+    const blob = await exportToBlob({
+      elements: snapshot.elements,
+      appState: snapshot.appState,
+      format: "jpg",
+      exportPadding: 24,
+      exportBackground: true,
+    });
+
+    downloadBlob(blob, "erd-diagram.jpg");
+  };
+
+  const handleExportSvg = async () => {
+    const snapshot = getExportSnapshot();
+    if (!snapshot) return;
+
+    const { exportToSvg } = await import("@excalidraw/excalidraw");
+    const svg = await exportToSvg({
+      elements: snapshot.elements,
+      appState: snapshot.appState,
+      exportPadding: 24,
+      exportBackground: true,
+    });
+
+    const serialized = new XMLSerializer().serializeToString(svg);
+    const blob = new Blob([serialized], { type: "image/svg+xml;charset=utf-8" });
+    downloadBlob(blob, "erd-diagram.svg");
+  };
+
   return (
     <main className="h-screen w-screen bg-slate-100 text-slate-900">
       <div className="absolute left-4 top-4 z-20 flex items-center gap-2 rounded-xl border border-slate-300 bg-white/95 px-3 py-2 shadow-sm">
         <h1 className="text-sm font-semibold">SQL ERD (Excalidraw)</h1>
       </div>
 
-      <div className="absolute right-4 top-4 z-20 flex items-center gap-2 rounded-xl border border-slate-300 bg-white/95 p-2 shadow-sm">
+      <div className="absolute right-4 top-4 z-20 flex items-center gap-2 rounded-xl border border-slate-300 bg-white/95 p-2 shadow-sm backdrop-blur">
         <button
           type="button"
           onClick={() => setIsSchemaOpen((value) => !value)}
-          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium"
+          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
         >
           {isSchemaOpen ? "Hide SQL" : "Show SQL"}
         </button>
         <button
           type="button"
           onClick={() => void handleGenerate()}
-          className="rounded-md border border-blue-700 bg-blue-700 px-3 py-1.5 text-sm font-semibold text-white"
+          className="rounded-md border border-blue-700 bg-blue-700 px-3 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-blue-800 focus:outline-none focus:ring-2 focus:ring-blue-500/40"
         >
           Generate
+        </button>
+        <div className="mx-1 h-6 w-px bg-slate-200" />
+        <button
+          type="button"
+          onClick={handleExportPng}
+          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+        >
+          PNG
+        </button>
+        <button
+          type="button"
+          onClick={handleExportJpg}
+          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+        >
+          JPG
+        </button>
+        <button
+          type="button"
+          onClick={handleExportSvg}
+          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+        >
+          SVG
         </button>
       </div>
 
@@ -1160,12 +1320,16 @@ export default function Home() {
         <Excalidraw
           key={`${layoutSeed}:${diagram.entities.length}`}
           initialData={initialData}
+          excalidrawAPI={(api) => {
+            excalidrawApiRef.current = api as unknown as ExcalidrawApiSnapshot;
+          }}
           UIOptions={{
             canvasActions: {
               changeViewBackgroundColor: false,
               toggleTheme: false,
               saveToActiveFile: false,
               loadScene: false,
+              export: false,
             },
           }}
           gridModeEnabled
