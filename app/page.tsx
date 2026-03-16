@@ -330,27 +330,57 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
 
   const ENT_W = 200,
     ENT_H = 70;
-  const ATT_RX = 68,
-    ATT_RY = 24;
-  // Min arc gap between adjacent attribute ellipses on the ring
-  const MIN_ARC_GAP = 20;
+  const ATT_RX = 66,
+    ATT_RY = 23;
+  const MIN_ARC_GAP = 18;
 
-  // Compute the orbit radius needed for a given attribute count so ellipses don't crowd
-  function orbitForCount(count: number): number {
-    if (count <= 1) return 160;
-    // Circumference must fit count*(ellipseWidth + gap)
-    const minCircumference = count * (ATT_RX * 2 + MIN_ARC_GAP);
-    const minR = minCircumference / (2 * Math.PI);
-    return Math.max(160, minR);
-  }
+  // Two-ring layout constants
+  // Attributes <= INNER_MAX go on the inner ring; the rest overflow to the outer ring.
+  // This caps the footprint: even a 20-attr entity fits in ~330px radius vs ~490px single-ring.
+  const INNER_MAX = 7; // max attrs on inner ring
+  const INNER_R = 175; // inner ring orbit radius
+  const OUTER_R = 305; // outer ring orbit radius (between the two rings lines can pass)
 
-  // Safe clearance radius: from entity centre to outer edge of attribute ring + padding
+  // Effective safe radius of an entity: outer edge of outermost ring + padding
   function safeRForCount(count: number): number {
-    return orbitForCount(count) + ATT_RX + 24;
+    if (count <= INNER_MAX) {
+      // Single ring — use minimum circumference-based radius
+      const minR =
+        count <= 1
+          ? INNER_R
+          : Math.max(
+              INNER_R,
+              (count * (ATT_RX * 2 + MIN_ARC_GAP)) / (2 * Math.PI),
+            );
+      return minR + ATT_RX + 22;
+    }
+    // Two rings — safe radius is outer ring edge
+    return OUTER_R + ATT_RX + 22;
   }
 
-  // Cell size must accommodate the largest possible entity in that row/col.
-  // We compute per-entity safe radii and use the max for grid sizing.
+  // How many attrs on inner vs outer ring
+  function splitRings(count: number): { inner: number; outer: number } {
+    if (count <= INNER_MAX) return { inner: count, outer: 0 };
+    // Split roughly half-half, but inner ring maxes at INNER_MAX
+    const inner = INNER_MAX;
+    const outer = count - inner;
+    return { inner, outer };
+  }
+
+  // Inner ring radius — spread evenly if fewer than INNER_MAX
+  function innerOrbit(innerCount: number): number {
+    if (innerCount <= 1) return INNER_R;
+    const minR = (innerCount * (ATT_RX * 2 + MIN_ARC_GAP)) / (2 * Math.PI);
+    return Math.max(INNER_R, minR);
+  }
+
+  // Outer ring radius — always at least OUTER_R, may grow if too many attrs
+  function outerOrbit(outerCount: number): number {
+    if (outerCount <= 1) return OUTER_R;
+    const minR = (outerCount * (ATT_RX * 2 + MIN_ARC_GAP)) / (2 * Math.PI);
+    return Math.max(OUTER_R, minR);
+  }
+
   const entitySafeR = model.entities.map((e) =>
     safeRForCount(e.attributes.length),
   );
@@ -360,7 +390,7 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
   const PAD = 360;
   const n = model.entities.length;
 
-  // Step 1: adjacency weights
+  // Adjacency weights
   const adjMap = new Map<string, number>();
   const relDegree = new Map<string, number>();
   for (const ent of model.entities) {
@@ -376,7 +406,7 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
     }
   }
 
-  // Step 2: sort entities by degree desc (most connected -> centre)
+  // Sort most-connected first
   const sortedEntities = [...model.entities].sort((a, b) => {
     const da = relDegree.get(getShortName(a.name).toLowerCase()) ?? 0;
     const db = relDegree.get(getShortName(b.name).toLowerCase()) ?? 0;
@@ -388,7 +418,7 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
   const canvasW = Math.max(2600, cols * CELL_W + PAD * 2);
   const canvasH = Math.max(1800, rows * CELL_H + PAD * 2);
 
-  // BFS spiral from centre outward
+  // BFS spiral from grid centre
   function spiralSlots(
     numCols: number,
     numRows: number,
@@ -435,17 +465,15 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
 
   const slots = spiralSlots(cols, rows);
 
-  // Greedy placement: pick free slot that maximises adjacency score with placed neighbors
+  // Greedy placement
   const slotAssignment = new Map<string, [number, number]>();
   const usedSlots = new Set<string>();
-
   for (const ent of sortedEntities) {
     const entName = getShortName(ent.name).toLowerCase();
     let bestSlot: [number, number] = slots.find(
       (s) => !usedSlots.has(s[0] + "," + s[1]),
     ) ?? [0, 0];
     let bestScore = -Infinity;
-
     for (const slot of slots) {
       const c = slot[0],
         r = slot[1];
@@ -468,8 +496,7 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
           if (placed[0] === nc && placed[1] === nr) {
             const edgeKey = [entName, placedName].sort().join(":");
             const w = adjMap.get(edgeKey) ?? 0;
-            const isDiag = Math.abs(d[0]) === 1 && Math.abs(d[1]) === 1;
-            score += isDiag ? w * 0.5 : w;
+            score += Math.abs(d[0]) === 1 && Math.abs(d[1]) === 1 ? w * 0.5 : w;
           }
         }
       }
@@ -479,27 +506,44 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
         bestSlot = [c, r];
       }
     }
-
     slotAssignment.set(entName, bestSlot);
     usedSlots.add(bestSlot[0] + "," + bestSlot[1]);
   }
 
-  // Build attribute ring with per-entity adaptive orbit radius
+  // Build two-ring attribute layout
+  // Inner ring: first INNER_MAX attrs (or all if count <= INNER_MAX)
+  // Outer ring: remaining attrs
+  // startAngle randomised per entity so each generate looks different
   function buildRing(
     ent: LayoutEntity,
     modelEnt: DiagramEntity,
     startAngle: number,
   ): LayoutAttribute[] {
-    const count = modelEnt.attributes.length;
-    const orbit = orbitForCount(count);
-    return modelEnt.attributes.map((attr, j) => {
+    const attrs = modelEnt.attributes;
+    const total = attrs.length;
+    const { inner: innerCount, outer: outerCount } = splitRings(total);
+    const iOrbit = innerOrbit(innerCount);
+    const oOrbit = outerOrbit(outerCount);
+    const result: LayoutAttribute[] = [];
+
+    attrs.forEach((attr, j) => {
+      const isOuter = j >= innerCount;
+      const ringIdx = isOuter ? j - innerCount : j;
+      const ringSize = isOuter ? outerCount : innerCount;
+      const orbit = isOuter ? oOrbit : iOrbit;
+      // Stagger outer ring by half a slot so it interleaves with inner ring visually
+      const ringStartAngle = isOuter
+        ? startAngle + Math.PI / ringSize
+        : startAngle;
       const angle =
-        count === 1 ? -Math.PI / 2 : startAngle + (2 * Math.PI * j) / count;
+        ringSize === 1
+          ? -Math.PI / 2
+          : ringStartAngle + (2 * Math.PI * ringIdx) / ringSize;
       const ax = ent.cx + orbit * Math.cos(angle);
       const ay = ent.cy + orbit * Math.sin(angle);
       const lineStart = rectEdgePoint(ent, { x: ax, y: ay });
       const lineEnd = ellipseEdgePoint(ax, ay, ATT_RX, ATT_RY, lineStart);
-      return {
+      result.push({
         id: ent.id + "-attr-" + attr.name.toLowerCase().replace(/\W+/g, "_"),
         x: ax,
         y: ay,
@@ -513,11 +557,13 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
         isPrimary: attr.isPrimary,
         isForeign: attr.isForeign,
         references: attr.references,
-      };
+      });
     });
+
+    return result;
   }
 
-  // Exact parametric segment vs padded-ellipse hit test
+  // Segment vs padded-ellipse hit test
   function segHitsEllipse(
     ax: number,
     ay: number,
@@ -553,9 +599,9 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
     px: number,
     py: number,
     ent: LayoutEntity,
-    entAttrCount: number,
+    attrCount: number,
   ): boolean {
-    return Math.hypot(px - ent.cx, py - ent.cy) < safeRForCount(entAttrCount);
+    return Math.hypot(px - ent.cx, py - ent.cy) < safeRForCount(attrCount);
   }
 
   function segCrossings(
@@ -566,15 +612,13 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
     allEnts: LayoutEntity[],
   ): number {
     let hits = 0;
-    for (const e of allEnts) {
-      for (const a of e.attributes) {
+    for (const e of allEnts)
+      for (const a of e.attributes)
         if (segHitsEllipse(ax, ay, bx, by, a.x, a.y, a.rx, a.ry)) hits++;
-      }
-    }
     return hits;
   }
 
-  // Step 3: place entities
+  // Place entities
   const entities: LayoutEntity[] = model.entities.map((ent) => {
     const entName = getShortName(ent.name).toLowerCase();
     const assigned = slotAssignment.get(entName) ?? [0, 0];
@@ -595,17 +639,16 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
     return entity;
   });
 
-  // Attribute count lookup for safe zone checks
   const attrCountMap = new Map<string, number>();
-  for (const ent of model.entities) {
+  for (const ent of model.entities)
     attrCountMap.set(
       "ent-" + ent.name.toLowerCase().replace(/\W+/g, "_"),
       ent.attributes.length,
     );
-  }
 
-  // Build relationship list
+  // Relationship list - deduplicated: one diamond per unique src->tgt pair
   type RelInfo = { srcId: string; tgtId: string };
+  const relsSeen = new Set<string>();
   const rels: RelInfo[] = [];
   for (const ent of entities) {
     for (const attr of ent.attributes) {
@@ -615,11 +658,15 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
           getShortName(e.name).toLowerCase() ===
           getShortName(attr.references!).toLowerCase(),
       );
-      if (tgt && tgt.id !== ent.id) rels.push({ srcId: ent.id, tgtId: tgt.id });
+      if (!tgt || tgt.id === ent.id) continue;
+      const rk = ent.id + ":" + tgt.id;
+      if (relsSeen.has(rk)) continue;
+      relsSeen.add(rk);
+      rels.push({ srcId: ent.id, tgtId: tgt.id });
     }
   }
 
-  // Pass 1: rotate ring to minimise crossings with relationship lines
+  // Pass 1: rotate rings to minimise crossings with relationship lines
   const ANGLE_STEPS = 90;
   for (const ent of entities) {
     const modelEnt = model.entities.find(
@@ -628,11 +675,9 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
     if (!modelEnt) continue;
     const myRels = rels.filter((r) => r.srcId === ent.id || r.tgtId === ent.id);
     if (myRels.length === 0) continue;
-
     const mySafeR = safeRForCount(modelEnt.attributes.length);
     let bestAngle = 0,
       bestHits = Infinity;
-
     for (let step = 0; step < ANGLE_STEPS; step++) {
       const angle = (step / ANGLE_STEPS) * Math.PI * 2;
       const ring = buildRing(ent, modelEnt, angle);
@@ -652,12 +697,11 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
           (isSource ? src.cy : tgt.cy) +
           (axDy / axLen) * (isSource ? 1 : -1) * (mySafeR + 30);
         const entEdge = rectEdgePoint(ent, { x: bx, y: by });
-        for (const a of ring) {
+        for (const a of ring)
           if (
             segHitsEllipse(entEdge.x, entEdge.y, bx, by, a.x, a.y, a.rx, a.ry)
           )
             hits++;
-        }
       }
       if (hits < bestHits) {
         bestHits = hits;
@@ -669,7 +713,12 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
   }
 
   // Pass 2: optimal diamond placement
+  // Key insight: each relationship gets a unique random axis offset so even when
+  // two rels share the same corridor, their diamonds land at different distances
+  // and never stack. We also penalise proximity to already-placed diamonds.
   const diamondPositions = new Map<string, Point>();
+  const DIAMOND_MIN_DIST = 90; // minimum px between any two diamond centres
+
   for (const rel of rels) {
     const src = entities.find((e) => e.id === rel.srcId)!;
     const tgt = entities.find((e) => e.id === rel.tgtId)!;
@@ -679,8 +728,8 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
     const tgtCount = attrCountMap.get(tgt.id) ?? 0;
     const srcSafeR = safeRForCount(srcCount);
     const tgtSafeR = safeRForCount(tgtCount);
-
     const key = rel.srcId + ":" + rel.tgtId;
+
     const axDx = tgt.cx - src.cx,
       axDy = tgt.cy - src.cy;
     const axLen = Math.hypot(axDx, axDy) || 1;
@@ -690,58 +739,98 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
       perpY = ux;
     const midX = (src.cx + tgt.cx) / 2,
       midY = (src.cy + tgt.cy) / 2;
-
-    // Axis corridor: from just outside src's safe zone to just outside tgt's safe zone
     const axStartX = src.cx + ux * (srcSafeR + 10),
       axStartY = src.cy + uy * (srcSafeR + 10);
     const axEndX = tgt.cx - ux * (tgtSafeR + 10),
       axEndY = tgt.cy - uy * (tgtSafeR + 10);
+    const axSpan = Math.hypot(axEndX - axStartX, axEndY - axStartY);
 
+    // Per-relationship random seed so each diamond gets a unique preferred position
+    // even when sharing the same axis corridor with another relationship
+    const relRng = makeRng(
+      (rel.srcId + rel.tgtId)
+        .split("")
+        .reduce((h, c) => (Math.imul(31, h) + c.charCodeAt(0)) | 0, seed),
+    );
+    // Random preferred t along axis [0.2 .. 0.8] and preferred perp offset [-120..120]
+    const preferredT = 0.2 + relRng() * 0.6;
+    const preferredPerp = (relRng() - 0.5) * 240;
+    const preferredX =
+      axStartX + (axEndX - axStartX) * preferredT + perpX * preferredPerp;
+    const preferredY =
+      axStartY + (axEndY - axStartY) * preferredT + perpY * preferredPerp;
+
+    // Dense candidate grid — axis steps + perpendicular offsets
     const candidates: Point[] = [];
-    // Dense grid along axis + perpendicular offsets
-    for (let ai = 0; ai <= 12; ai++) {
-      const t = ai / 12;
+
+    // Always include the preferred position first so it wins on tie-break
+    candidates.push({ x: preferredX, y: preferredY });
+
+    for (let ai = 0; ai <= 16; ai++) {
+      const t = ai / 16;
       const bx = axStartX + (axEndX - axStartX) * t;
       const by = axStartY + (axEndY - axStartY) * t;
-      for (const d of [0, 40, 80, 130, 190, 260, 350, 450]) {
-        for (const s of d === 0 ? [0] : [1, -1]) {
+      for (const d of [0, 50, 100, 160, 230, 310, 400, 500]) {
+        for (const s of d === 0 ? [0] : [1, -1])
           candidates.push({ x: bx + perpX * d * s, y: by + perpY * d * s });
-        }
       }
     }
-    // Extra wide perpendicular sweeps from midpoint
-    for (const d of [60, 120, 200, 300, 420]) {
-      for (const s of [1, -1]) {
-        candidates.push({ x: midX + perpX * d * s, y: midY + perpY * d * s });
-        // Also offset 1/3 and 2/3 along axis
-        const ax3X = axStartX + (axEndX - axStartX) / 3;
-        const ax3Y = axStartY + (axEndY - axStartY) / 3;
-        const ax23X = axStartX + ((axEndX - axStartX) * 2) / 3;
-        const ax23Y = axStartY + ((axEndY - axStartY) * 2) / 3;
-        candidates.push({ x: ax3X + perpX * d * s, y: ax3Y + perpY * d * s });
-        candidates.push({ x: ax23X + perpX * d * s, y: ax23Y + perpY * d * s });
+    // Extra wide perp sweeps from thirds of the axis
+    for (const frac of [1 / 4, 1 / 2, 3 / 4]) {
+      const bx = axStartX + (axEndX - axStartX) * frac;
+      const by = axStartY + (axEndY - axStartY) * frac;
+      for (const d of [70, 150, 240, 340, 460]) {
+        for (const s of [1, -1])
+          candidates.push({ x: bx + perpX * d * s, y: by + perpY * d * s });
       }
     }
 
-    let bestPos = { x: midX, y: midY },
-      bestScore = Infinity;
+    let bestPos = { x: preferredX, y: preferredY };
+    let bestScore = Infinity;
+
     for (const cand of candidates) {
-      // Must be outside BOTH entities' adaptive safe zones
       if (pointInsideSafeZone(cand.x, cand.y, src, srcCount)) continue;
       if (pointInsideSafeZone(cand.x, cand.y, tgt, tgtCount)) continue;
 
       const srcEdge = rectEdgePoint(src, cand);
       const tgtEdge = rectEdgePoint(tgt, cand);
+
+      // Count attribute crossings
       const hits =
         segCrossings(srcEdge.x, srcEdge.y, cand.x, cand.y, entities) +
         segCrossings(cand.x, cand.y, tgtEdge.x, tgtEdge.y, entities);
-      const dist = Math.hypot(cand.x - midX, cand.y - midY);
-      const score = hits * 10000 + dist;
+
+      // Penalty for being too close to an already-placed diamond
+      let overlapPenalty = 0;
+      for (const [, placed] of diamondPositions) {
+        const dToDiamond = Math.hypot(cand.x - placed.x, cand.y - placed.y);
+        if (dToDiamond < DIAMOND_MIN_DIST) {
+          // Strong penalty that grows as distance shrinks
+          overlapPenalty += (DIAMOND_MIN_DIST - dToDiamond) * 80;
+        }
+      }
+
+      // Distance from preferred position (encourages spread)
+      const distFromPreferred = Math.hypot(
+        cand.x - preferredX,
+        cand.y - preferredY,
+      );
+
+      // Distance from midpoint (secondary tiebreak — prefer central diamonds)
+      const distFromMid = Math.hypot(cand.x - midX, cand.y - midY);
+
+      const score =
+        hits * 10000 +
+        overlapPenalty +
+        distFromPreferred * 0.5 +
+        distFromMid * 0.1;
+
       if (score < bestScore) {
         bestScore = score;
         bestPos = cand;
       }
     }
+
     diamondPositions.set(key, bestPos);
   }
 
@@ -952,30 +1041,45 @@ function sideLabel(p1: Point, p2: Point, text: string): ExElement {
 }
 
 function buildElements(layout: DiagramLayout): ExElement[] {
-  const el: ExElement[] = [];
   const diamonds: Map<string, Point> =
     (layout.entities as any).__diamonds ?? new Map();
+  const DW = 116,
+    DH = 52;
 
-  // Entities + attributes
+  // Painter's algorithm: draw in layers so shapes always sit on top of lines.
+  // Layer 0 - relationship lines (deepest)
+  // Layer 1 - spoke lines from entity to attributes
+  // Layer 2 - entity rects + attribute ellipses + diamond shapes (mid)
+  // Layer 3 - all text labels (top)
+  const relLines: ExElement[] = [];
+  const spokeLines: ExElement[] = [];
+  const shapes: ExElement[] = [];
+  const labels: ExElement[] = [];
+
+  // - Spoke lines + ellipses + entity rects -
   for (const ent of layout.entities) {
-    el.push(makeRect(ent.x, ent.y, ent.width, ent.height));
-    el.push(
+    // Entity rectangle goes in shapes layer
+    shapes.push(makeRect(ent.x, ent.y, ent.width, ent.height));
+    labels.push(
       makeText(ent.cx, ent.cy, ent.name, 16, true, { strokeColor: "#1e3a8a" }),
     );
 
     for (const attr of ent.attributes) {
-      // Spoke line
-      el.push(
-        makeLine(
-          attr.lineStart.x,
-          attr.lineStart.y,
-          attr.lineEnd.x,
-          attr.lineEnd.y,
-          {
-            strokeColor: "#94a3b8",
-            strokeWidth: 1.5,
-          },
-        ),
+      // Spoke: draw from entity rect edge TOWARD the ellipse, but stop 6px
+      // short of the ellipse surface so the line visually "plugs into" the
+      // ellipse rather than poking through it.
+      const dx = attr.lineEnd.x - attr.lineStart.x;
+      const dy = attr.lineEnd.y - attr.lineStart.y;
+      const len = Math.hypot(dx, dy) || 1;
+      // Shorten end by 6px so ellipse cleanly covers the tip
+      const ex = attr.lineEnd.x - (dx / len) * 6;
+      const ey = attr.lineEnd.y - (dy / len) * 6;
+
+      spokeLines.push(
+        makeLine(attr.lineStart.x, attr.lineStart.y, ex, ey, {
+          strokeColor: "#cbd5e1",
+          strokeWidth: 1.2,
+        }),
       );
 
       const bg = attr.isPrimary
@@ -989,7 +1093,7 @@ function buildElements(layout: DiagramLayout): ExElement[] {
           ? "#15803d"
           : "#475569";
 
-      el.push(
+      shapes.push(
         makeEllipse(
           attr.x - attr.rx,
           attr.y - attr.ry,
@@ -1003,10 +1107,9 @@ function buildElements(layout: DiagramLayout): ExElement[] {
         ),
       );
 
-      // Double-border for PK
       if (attr.isPrimary) {
         const ins = 4;
-        el.push(
+        shapes.push(
           makeEllipse(
             attr.x - attr.rx + ins,
             attr.y - attr.ry + ins,
@@ -1021,7 +1124,7 @@ function buildElements(layout: DiagramLayout): ExElement[] {
         );
       }
 
-      el.push(
+      labels.push(
         makeText(attr.x, attr.y, attr.label, 12, attr.isPrimary, {
           strokeColor: attr.isPrimary
             ? "#92400e"
@@ -1033,9 +1136,9 @@ function buildElements(layout: DiagramLayout): ExElement[] {
     }
   }
 
-  // Relationships
-  const DW = 116,
-    DH = 52;
+  // - Relationship lines + diamonds -
+  // Guard against duplicate diamonds when multiple FK columns point to the same table
+  const drawnRels = new Set<string>();
 
   for (const ent of layout.entities) {
     for (const attr of ent.attributes) {
@@ -1047,7 +1150,10 @@ function buildElements(layout: DiagramLayout): ExElement[] {
       );
       if (!tgt) continue;
 
-      const key = `${ent.id}:${tgt.id}`;
+      const key = ent.id + ":" + tgt.id;
+      if (drawnRels.has(key)) continue;
+      drawnRels.add(key);
+
       const dpos = diamonds.get(key) ?? {
         x: (ent.cx + tgt.cx) / 2,
         y: (ent.cy + tgt.cy) / 2,
@@ -1055,36 +1161,40 @@ function buildElements(layout: DiagramLayout): ExElement[] {
       const dmx = dpos.x,
         dmy = dpos.y;
 
-      // Diamond shape
-      el.push(makeDiamond(dmx - DW / 2, dmy - DH / 2, DW, DH));
-      el.push(makeText(dmx, dmy, "has", 12, true, { strokeColor: "#92400e" }));
+      // Diamond shape (goes in shapes so it paints over spoke lines)
+      shapes.push(makeDiamond(dmx - DW / 2, dmy - DH / 2, DW, DH));
+      labels.push(
+        makeText(dmx, dmy, "has", 12, true, { strokeColor: "#92400e" }),
+      );
 
-      // Source → diamond
+      // Source entity → diamond  (relationship line, behind everything)
       const srcPt = rectEdgePoint(ent, { x: dmx, y: dmy });
       const dEntry = diamondEdgePt(dmx, dmy, DW, DH, srcPt.x, srcPt.y);
-      el.push(
+      relLines.push(
         makeLine(srcPt.x, srcPt.y, dEntry.x, dEntry.y, {
-          strokeColor: "#475569",
+          strokeColor: "#64748b",
           strokeWidth: 1.5,
         }),
       );
-      el.push(sideLabel(srcPt, dEntry, "1"));
+      labels.push(sideLabel(srcPt, dEntry, "1"));
 
-      // Diamond → target
+      // Diamond → target entity
       const tgtPt = rectEdgePoint(tgt, { x: dmx, y: dmy });
       const dExit = diamondEdgePt(dmx, dmy, DW, DH, tgtPt.x, tgtPt.y);
-      el.push(
+      relLines.push(
         makeLine(dExit.x, dExit.y, tgtPt.x, tgtPt.y, {
-          strokeColor: "#475569",
+          strokeColor: "#64748b",
           strokeWidth: 1.5,
           endArrowhead: "arrow",
         }),
       );
-      el.push(sideLabel(dExit, tgtPt, "N"));
+      labels.push(sideLabel(dExit, tgtPt, "N"));
     }
   }
 
-  return el;
+  // Compose final array in painter's order:
+  // rel lines → spoke lines → shapes (rects/ellipses/diamonds) → labels
+  return [...relLines, ...spokeLines, ...shapes, ...labels];
 }
 
 const SAMPLE_SQL = `CREATE TABLE users (
@@ -1196,178 +1306,87 @@ export default function ERDiagramPage() {
     e.target.value = "";
   };
 
-  const getSnapshot = () => {
-    const api = excalidrawApiRef.current;
-    if (!api) return null;
-    return {
-      elements: api.getSceneElements(),
-      appState: {
-        ...api.getAppState(),
-        exportWithDarkMode: false,
-        viewBackgroundColor: "#ffffff",
-      },
-    };
-  };
-
-  const exportAs = async (format: "png" | "jpg" | "svg") => {
-    const snap = getSnapshot();
-    if (!snap) return;
-    const mod = await import("@excalidraw/excalidraw");
-    if (format === "svg") {
-      const svg = await mod.exportToSvg({
-        ...snap,
-        exportPadding: 32,
-        exportBackground: true,
-      });
-      dl(
-        new Blob([new XMLSerializer().serializeToString(svg)], {
-          type: "image/svg+xml",
-        }),
-        "erd.svg",
-      );
-    } else {
-      dl(
-        await mod.exportToBlob({
-          ...snap,
-          format,
-          exportPadding: 32,
-          exportBackground: true,
-        }),
-        `erd.${format}`,
-      );
-    }
-  };
-
-  const dl = (blob: Blob, name: string) => {
-    const url = URL.createObjectURL(blob);
-    Object.assign(document.createElement("a"), {
-      href: url,
-      download: name,
-    }).click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  };
-
-  const tableCount = model.entities.length;
-  const colCount = model.entities.reduce((s, e) => s + e.attributes.length, 0);
-  const relCount = model.entities.reduce(
-    (s, e) =>
-      s + e.attributes.filter((a) => a.isForeign && a.references).length,
-    0,
-  );
-
   const PANEL_W = 440;
 
   return (
-    <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-gray-50 font-sans text-gray-900">
-      {/* - Top bar - */}
-      <header className="relative z-30 flex h-13 shrink-0 items-center justify-between border-b border-gray-200 bg-white px-4 shadow-sm">
-        {/* Brand */}
-        <div className="flex items-center gap-3">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-600 shadow shadow-blue-200">
-            <svg
-              viewBox="0 0 16 16"
-              fill="none"
-              className="h-4 w-4"
-              stroke="white"
-              strokeWidth="1.7"
-            >
-              <rect x="1.5" y="3.5" width="5" height="4" rx="0.75" />
-              <rect x="9.5" y="8.5" width="5" height="4" rx="0.75" />
-              <path d="M6.5 5.5h3v5h-3" strokeLinejoin="round" />
-            </svg>
-          </div>
-          <div className="flex flex-col leading-tight">
-            <span className="text-sm font-bold tracking-tight text-gray-900">
-              SQL <span className="text-blue-600">ERD</span>
-            </span>
-            <span className="hidden text-[10px] font-medium text-gray-400 sm:block">
-              Entity Relationship Diagram
-            </span>
-          </div>
-
-          {/* Stats */}
-          <div className="ml-4 hidden items-center divide-x divide-gray-200 rounded-lg border border-gray-200 bg-gray-50 sm:flex">
-            {[
-              { n: tableCount, label: "tables" },
-              { n: colCount, label: "columns" },
-              { n: relCount, label: "relations" },
-            ].map(({ n, label }) => (
-              <div
-                key={label}
-                className="flex items-baseline gap-1 px-3 py-1.5"
-              >
-                <span className="text-sm font-bold text-blue-600 tabular-nums">
-                  {n}
-                </span>
-                <span className="text-xs text-gray-400">{label}</span>
-              </div>
-            ))}
-          </div>
+    <div className="relative h-screen w-screen overflow-hidden bg-white font-sans">
+      {/* Floating pill — top-left, sits above Excalidraw's own toolbar */}
+      <div className="absolute left-1/2 top-3 z-30 -translate-x-1/2 flex items-center gap-1.5 rounded-full border border-gray-200 bg-white px-2 py-1.5 shadow-md">
+        {/* Logo */}
+        <div className="flex h-6 w-6 items-center justify-center rounded-full bg-blue-600">
+          <svg
+            viewBox="0 0 16 16"
+            fill="none"
+            className="h-3.5 w-3.5"
+            stroke="white"
+            strokeWidth="1.8"
+          >
+            <rect x="1.5" y="3.5" width="5" height="4" rx="0.75" />
+            <rect x="9.5" y="8.5" width="5" height="4" rx="0.75" />
+            <path d="M6.5 5.5h3v5h-3" strokeLinejoin="round" />
+          </svg>
         </div>
 
-        {/* Actions */}
-        <div className="flex items-center gap-2">
-          {/* Toggle panel */}
-          <button
-            onClick={() => setPanelOpen((v) => !v)}
-            className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs font-medium text-gray-600 shadow-sm transition hover:border-gray-300 hover:bg-gray-50 hover:text-gray-900"
+        <span className="text-xs font-semibold text-gray-700 pr-1">
+          SQL ERD
+        </span>
+
+        <div className="h-4 w-px bg-gray-200" />
+
+        {/* Toggle SQL panel */}
+        <button
+          onClick={() => setPanelOpen((v) => !v)}
+          title={panelOpen ? "Hide SQL panel" : "Show SQL panel"}
+          className="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium text-gray-600 transition hover:bg-gray-100 hover:text-gray-900"
+        >
+          <svg
+            viewBox="0 0 14 10"
+            fill="none"
+            className="h-3 w-3"
+            stroke="currentColor"
+            strokeWidth="1.7"
+            strokeLinecap="round"
           >
+            <path d="M1 1h12M1 5h7M1 9h9" />
+          </svg>
+          {panelOpen ? "Hide SQL" : "Show SQL"}
+        </button>
+
+        <div className="h-4 w-px bg-gray-200" />
+
+        {/* Generate button */}
+        <button
+          onClick={handleGenerate}
+          disabled={generating}
+          className="flex items-center gap-1.5 rounded-full bg-blue-600 px-3 py-1 text-xs font-semibold text-white transition hover:bg-blue-700 disabled:opacity-60 active:scale-95"
+        >
+          {generating ? (
             <svg
-              viewBox="0 0 14 10"
+              className="h-3 w-3 animate-spin"
+              viewBox="0 0 12 12"
               fill="none"
-              className="h-3.5 w-3.5"
               stroke="currentColor"
-              strokeWidth="1.6"
-              strokeLinecap="round"
+              strokeWidth="2"
             >
-              <path d="M1 1h12M1 5h7M1 9h9" />
+              <circle cx="6" cy="6" r="4" strokeOpacity="0.3" />
+              <path d="M6 2a4 4 0 0 1 4 4" />
             </svg>
-            {panelOpen ? "Hide SQL" : "Show SQL"}
-          </button>
-
-          {/* Generate */}
-          <button
-            onClick={handleGenerate}
-            disabled={generating}
-            className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white shadow shadow-blue-200 transition hover:bg-blue-700 active:scale-95 disabled:opacity-60"
-          >
-            {generating ? (
-              <svg
-                className="h-3.5 w-3.5 animate-spin"
-                viewBox="0 0 12 12"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-              >
-                <circle cx="6" cy="6" r="4" strokeOpacity="0.25" />
-                <path d="M6 2a4 4 0 0 1 4 4" />
-              </svg>
-            ) : (
-              <svg viewBox="0 0 10 12" fill="currentColor" className="h-3 w-3">
-                <polygon points="0,0 10,6 0,12" />
-              </svg>
-            )}
-            {generating ? "Generating…" : "Generate ERD"}
-          </button>
-
-          <div className="h-6 w-px bg-gray-200" />
-
-          {/* Export buttons */}
-          {(["png", "jpg", "svg"] as const).map((fmt) => (
-            <button
-              key={fmt}
-              onClick={() => exportAs(fmt)}
-              className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-[10px] font-semibold uppercase tracking-widest text-gray-500 shadow-sm transition hover:border-gray-300 hover:bg-gray-50 hover:text-gray-800"
+          ) : (
+            <svg
+              viewBox="0 0 10 12"
+              fill="currentColor"
+              className="h-2.5 w-2.5"
             >
-              {fmt}
-            </button>
-          ))}
-        </div>
-      </header>
+              <polygon points="0,0 10,6 0,12" />
+            </svg>
+          )}
+          {generating ? "Generating…" : "Generate ERD"}
+        </button>
+      </div>
 
       {/* - Body - */}
-      <div className="relative flex-1 overflow-hidden">
-        {/* Canvas — positioned absolutely so closing the panel truly gives it 100% width */}
+      <div className="relative h-full w-full">
+        {/* Canvas */}
         <div
           className="absolute inset-0 transition-all duration-300"
           style={{ right: panelOpen ? PANEL_W : 0 }}
@@ -1377,15 +1396,6 @@ export default function ERDiagramPage() {
             initialData={initialData}
             excalidrawAPI={(api: any) => {
               excalidrawApiRef.current = api;
-            }}
-            UIOptions={{
-              canvasActions: {
-                changeViewBackgroundColor: false,
-                toggleTheme: false,
-                saveToActiveFile: false,
-                loadScene: false,
-                export: false,
-              },
             }}
           />
         </div>
