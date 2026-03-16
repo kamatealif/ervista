@@ -3,7 +3,7 @@
 import dynamic from "next/dynamic";
 import { useMemo, useState, useRef } from "react";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// - Types -
 
 type DiagramAttribute = {
   name: string;
@@ -22,7 +22,7 @@ type DiagramModel = {
   entities: DiagramEntity[];
 };
 
-// ─── SQL Parser ───────────────────────────────────────────────────────────────
+// - SQL Parser -
 
 function stripIdentifierQuotes(value: string): string {
   const t = value.trim();
@@ -245,7 +245,7 @@ function parseSqlSchema(sql: string): DiagramModel {
   return { entities };
 }
 
-// ─── Layout (with random seed) ────────────────────────────────────────────────
+// - Layout (with random seed) -
 
 type Point = { x: number; y: number };
 
@@ -332,65 +332,49 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
     ENT_H = 70;
   const ATT_RX = 72,
     ATT_RY = 26;
-  const ORBIT_R = 165;
-  const PAD = 300;
-  const CELL_W = (ORBIT_R + ATT_RX) * 2 + 140;
-  const CELL_H = (ORBIT_R + ATT_RY) * 2 + 140;
+  // How far attribute centres sit from entity centre
+  const ATTR_ORBIT = 195;
+  // Safe clearance radius around an entity (entity half-diagonal + orbit + attr half-width)
+  const SAFE_R = ATTR_ORBIT + ATT_RX + 20;
+
+  // Grid cell must be wide/tall enough that adjacent rings don't overlap
+  const CELL_W = SAFE_R * 2 + 200;
+  const CELL_H = SAFE_R * 2 + 200;
+  const PAD = 350;
 
   const n = model.entities.length;
-  // Randomize column count slightly: prefer sqrt but jitter by ±1
   const baseCols = Math.max(1, Math.ceil(Math.sqrt(n)));
-  const cols = Math.max(1, baseCols + (rng() > 0.5 && baseCols > 1 ? -1 : 0));
+  // Slightly prefer wider layouts for readability
+  const cols = Math.min(n, baseCols + (rng() > 0.6 ? 1 : 0));
   const rows = Math.ceil(n / cols);
 
-  const canvasW = Math.max(1600, cols * CELL_W + PAD * 2);
-  const canvasH = Math.max(900, rows * CELL_H + PAD * 2);
+  const canvasW = Math.max(2200, cols * CELL_W + PAD * 2);
+  const canvasH = Math.max(1400, rows * CELL_H + PAD * 2);
 
-  // Build shuffled entity order per seed
+  // Fisher-Yates shuffle of slot indices
   const indices = Array.from({ length: n }, (_, i) => i);
-  for (let i = indices.length - 1; i > 0; i--) {
+  for (let i = n - 1; i > 0; i--) {
     const j = Math.floor(rng() * (i + 1));
     [indices[i], indices[j]] = [indices[j]!, indices[i]!];
   }
 
-  const entities: LayoutEntity[] = model.entities.map((ent, originalIdx) => {
-    // find this entity's slot in the shuffled grid
-    const slotIdx = indices.indexOf(originalIdx);
-    const col = slotIdx % cols;
-    const row = Math.floor(slotIdx / cols);
+  // ---- helpers ----
 
-    // Add a small random jitter to each entity center so it doesn't look grid-locked
-    const jitterX = (rng() - 0.5) * 60;
-    const jitterY = (rng() - 0.5) * 60;
-
-    const cx = PAD + col * CELL_W + CELL_W / 2 + jitterX;
-    const cy = PAD + row * CELL_H + CELL_H / 2 + jitterY;
-
-    const entity: LayoutEntity = {
-      id: `ent-${ent.name.toLowerCase().replace(/\W+/g, "_")}`,
-      name: getShortName(ent.name),
-      x: cx - ENT_W / 2,
-      y: cy - ENT_H / 2,
-      width: ENT_W,
-      height: ENT_H,
-      cx,
-      cy,
-      attributes: [],
-    };
-
-    const count = ent.attributes.length;
-    // Randomize the starting angle so attributes fan out differently each time
-    const startAngle = rng() * Math.PI * 2;
-
-    ent.attributes.forEach((attr, j) => {
+  function buildRing(
+    ent: LayoutEntity,
+    modelEnt: DiagramEntity,
+    startAngle: number,
+  ): LayoutAttribute[] {
+    const count = modelEnt.attributes.length;
+    return modelEnt.attributes.map((attr, j) => {
       const angle =
         count === 1 ? -Math.PI / 2 : startAngle + (2 * Math.PI * j) / count;
-      const ax = cx + (ORBIT_R + ATT_RX * 0.4) * Math.cos(angle);
-      const ay = cy + (ORBIT_R + ATT_RY * 0.4) * Math.sin(angle);
-      const lineStart = rectEdgePoint(entity, { x: ax, y: ay });
+      const ax = ent.cx + ATTR_ORBIT * Math.cos(angle);
+      const ay = ent.cy + ATTR_ORBIT * Math.sin(angle);
+      const lineStart = rectEdgePoint(ent, { x: ax, y: ay });
       const lineEnd = ellipseEdgePoint(ax, ay, ATT_RX, ATT_RY, lineStart);
-      entity.attributes.push({
-        id: `${entity.id}-attr-${attr.name.toLowerCase().replace(/\W+/g, "_")}`,
+      return {
+        id: `${ent.id}-attr-${attr.name.toLowerCase().replace(/\W+/g, "_")}`,
         x: ax,
         y: ay,
         rx: ATT_RX,
@@ -403,16 +387,276 @@ function buildLayout(model: DiagramModel, seed: number): DiagramLayout {
         isPrimary: attr.isPrimary,
         isForeign: attr.isForeign,
         references: attr.references,
-      });
+      };
     });
+  }
 
+  // Exact parametric line-vs-ellipse hit test (padded)
+  function segHitsEllipse(
+    ax: number,
+    ay: number,
+    bx: number,
+    by: number,
+    ex: number,
+    ey: number,
+    erx: number,
+    ery: number,
+    pad = 12,
+  ): boolean {
+    const rx2 = erx + pad,
+      ry2 = ery + pad;
+    const dx = bx - ax,
+      dy = by - ay;
+    const fx = (ax - ex) / rx2,
+      fy = (ay - ey) / ry2;
+    const dxn = dx / rx2,
+      dyn = dy / ry2;
+    const a = dxn * dxn + dyn * dyn;
+    if (a < 1e-12) return false;
+    const b2 = fx * dxn + fy * dyn;
+    const c = fx * fx + fy * fy - 1;
+    const disc = b2 * b2 - a * c;
+    if (disc < 0) return false;
+    const sq = Math.sqrt(disc);
+    const t1 = (-b2 - sq) / a;
+    const t2 = (-b2 + sq) / a;
+    return (t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1) || (t1 < 0 && t2 > 1);
+  }
+
+  // Is a point inside the "safe zone" of an entity (entity rect + attr ring)?
+  function pointInsideSafeZone(
+    px: number,
+    py: number,
+    ent: LayoutEntity,
+  ): boolean {
+    return Math.hypot(px - ent.cx, py - ent.cy) < SAFE_R;
+  }
+
+  // Count total attribute ellipse crossings for a segment across ALL entities
+  function segCrossings(
+    ax: number,
+    ay: number,
+    bx: number,
+    by: number,
+    allEnts: LayoutEntity[],
+  ): number {
+    let hits = 0;
+    for (const e of allEnts) {
+      for (const a of e.attributes) {
+        if (segHitsEllipse(ax, ay, bx, by, a.x, a.y, a.rx, a.ry)) hits++;
+      }
+    }
+    return hits;
+  }
+
+  // ---- place entities ----
+  const entities: LayoutEntity[] = model.entities.map((ent, originalIdx) => {
+    const slot = indices.indexOf(originalIdx);
+    const col = slot % cols;
+    const row = Math.floor(slot / cols);
+    // No jitter — grid alignment makes diamond placement more predictable
+    const cx = PAD + col * CELL_W + CELL_W / 2;
+    const cy = PAD + row * CELL_H + CELL_H / 2;
+    const entity: LayoutEntity = {
+      id: `ent-${ent.name.toLowerCase().replace(/\W+/g, "_")}`,
+      name: getShortName(ent.name),
+      x: cx - ENT_W / 2,
+      y: cy - ENT_H / 2,
+      width: ENT_W,
+      height: ENT_H,
+      cx,
+      cy,
+      attributes: [],
+    };
+    // Initial ring at random angle; will be optimised below
+    entity.attributes = buildRing(entity, ent, rng() * Math.PI * 2);
     return entity;
   });
 
+  // Build full relationship list
+  type RelInfo = { srcId: string; tgtId: string };
+  const rels: RelInfo[] = [];
+  for (const ent of entities) {
+    for (const attr of ent.attributes) {
+      if (!attr.isForeign || !attr.references) continue;
+      const tgt = entities.find(
+        (e) =>
+          getShortName(e.name).toLowerCase() ===
+          getShortName(attr.references!).toLowerCase(),
+      );
+      if (tgt && tgt.id !== ent.id) rels.push({ srcId: ent.id, tgtId: tgt.id });
+    }
+  }
+
+  // ---- Pass 1: optimise each entity's ring rotation ----
+  // For each entity involved in rels, rotate its attribute ring so the
+  // relationship lines that pass through its space miss its attributes.
+  // Diamond tentative position = point on the axis between the two entities,
+  // just outside THIS entity's safe zone (so the segment from entity-edge to
+  // that point is short and provably stays inside the inter-entity corridor).
+
+  const ANGLE_STEPS = 90; // 4-degree resolution
+
+  for (const ent of entities) {
+    const modelEnt = model.entities.find(
+      (e) => getShortName(e.name) === ent.name,
+    )!;
+    if (!modelEnt) continue;
+
+    const myRels = rels.filter((r) => r.srcId === ent.id || r.tgtId === ent.id);
+    if (myRels.length === 0) continue;
+
+    let bestAngle = 0,
+      bestHits = Infinity;
+
+    for (let step = 0; step < ANGLE_STEPS; step++) {
+      const angle = (step / ANGLE_STEPS) * Math.PI * 2;
+      const ring = buildRing(ent, modelEnt, angle);
+
+      let hits = 0;
+      for (const rel of myRels) {
+        const src = entities.find((e) => e.id === rel.srcId)!;
+        const tgt = entities.find((e) => e.id === rel.tgtId)!;
+        if (!src || !tgt) continue;
+
+        // Tentative diamond: along the axis, just past this entity's safe zone
+        const axDx = tgt.cx - src.cx,
+          axDy = tgt.cy - src.cy;
+        const axLen = Math.hypot(axDx, axDy) || 1;
+        // From the current entity centre, step out SAFE_R + 30 toward the other entity
+        const isSource = ent.id === src.id;
+        const baseCx = isSource ? src.cx : tgt.cx;
+        const dirMul = isSource ? 1 : -1;
+        const tentDmx = baseCx + (axDx / axLen) * dirMul * (SAFE_R + 30);
+        const tentDmy =
+          (isSource ? src.cy : tgt.cy) +
+          (axDy / axLen) * dirMul * (SAFE_R + 30);
+
+        const entEdge = rectEdgePoint(ent, { x: tentDmx, y: tentDmy });
+        for (const a of ring) {
+          if (
+            segHitsEllipse(
+              entEdge.x,
+              entEdge.y,
+              tentDmx,
+              tentDmy,
+              a.x,
+              a.y,
+              a.rx,
+              a.ry,
+            )
+          )
+            hits++;
+        }
+      }
+
+      if (hits < bestHits) {
+        bestHits = hits;
+        bestAngle = angle;
+        if (bestHits === 0) break;
+      }
+    }
+
+    ent.attributes = buildRing(ent, modelEnt, bestAngle);
+  }
+
+  // ---- Pass 2: find best diamond position for each relationship ----
+  // The diamond must be:
+  //   a) outside the safe zone of BOTH entities
+  //   b) the two line segments (srcEdge->diamond, diamond->tgtEdge) cross
+  //      the fewest possible attribute ellipses
+  //   c) not inside any other entity's safe zone if possible
+
+  const diamondPositions = new Map<string, Point>();
+
+  for (const rel of rels) {
+    const src = entities.find((e) => e.id === rel.srcId)!;
+    const tgt = entities.find((e) => e.id === rel.tgtId)!;
+    if (!src || !tgt) continue;
+
+    const key = `${rel.srcId}:${rel.tgtId}`;
+
+    const axDx = tgt.cx - src.cx;
+    const axDy = tgt.cy - src.cy;
+    const axLen = Math.hypot(axDx, axDy) || 1;
+    const ux = axDx / axLen,
+      uy = axDy / axLen; // unit vector src->tgt
+    const px = -uy,
+      py = ux; // perpendicular
+
+    // Midpoint between the two entity centres
+    const midX = (src.cx + tgt.cx) / 2;
+    const midY = (src.cy + tgt.cy) / 2;
+
+    // Build a dense candidate grid:
+    // - Along the axis: from just outside src's safe zone to just outside tgt's safe zone
+    // - Perpendicular: ±0, ±60, ±120, ±200, ±300
+    const candidates: Point[] = [];
+
+    const axSteps = 9; // how many points along the axis
+    for (let ai = 0; ai <= axSteps; ai++) {
+      const t = ai / axSteps;
+      // Parametric position along axis: start = src.cx + SAFE_R*ux, end = tgt.cx - SAFE_R*ux
+      const axStartX = src.cx + ux * (SAFE_R + 10);
+      const axStartY = src.cy + uy * (SAFE_R + 10);
+      const axEndX = tgt.cx - ux * (SAFE_R + 10);
+      const axEndY = tgt.cy - uy * (SAFE_R + 10);
+      const bx = axStartX + (axEndX - axStartX) * t;
+      const by = axStartY + (axEndY - axStartY) * t;
+
+      for (const perpDist of [0, 60, 120, 180, 260, 360]) {
+        for (const sign of perpDist === 0 ? [0] : [1, -1]) {
+          candidates.push({
+            x: bx + px * perpDist * sign,
+            y: by + py * perpDist * sign,
+          });
+        }
+      }
+    }
+
+    // Also add pure perpendicular offsets from midpoint at larger distances
+    for (const perpDist of [80, 160, 240, 320, 420]) {
+      for (const sign of [1, -1]) {
+        candidates.push({
+          x: midX + px * perpDist * sign,
+          y: midY + py * perpDist * sign,
+        });
+      }
+    }
+
+    let bestPos = candidates[0] ?? { x: midX, y: midY };
+    let bestScore = Infinity;
+
+    for (const cand of candidates) {
+      // Skip if inside either entity's safe zone
+      if (pointInsideSafeZone(cand.x, cand.y, src)) continue;
+      if (pointInsideSafeZone(cand.x, cand.y, tgt)) continue;
+
+      const srcEdge = rectEdgePoint(src, cand);
+      const tgtEdge = rectEdgePoint(tgt, cand);
+
+      const hits =
+        segCrossings(srcEdge.x, srcEdge.y, cand.x, cand.y, entities) +
+        segCrossings(cand.x, cand.y, tgtEdge.x, tgtEdge.y, entities);
+
+      // Prefer: fewer hits > closer to midpoint
+      const dist = Math.hypot(cand.x - midX, cand.y - midY);
+      const score = hits * 10000 + dist;
+
+      if (score < bestScore) {
+        bestScore = score;
+        bestPos = cand;
+      }
+    }
+
+    diamondPositions.set(key, bestPos);
+  }
+
+  (entities as any).__diamonds = diamondPositions;
   return { width: canvasW, height: canvasH, entities };
 }
 
-// ─── Excalidraw Element Builder ───────────────────────────────────────────────
+// Excalidraw Element Builder
 
 type ExElement = Record<string, unknown>;
 let _eid = 1;
@@ -443,7 +687,7 @@ const makeRect = (
   y,
   width: w,
   height: h,
-  strokeColor: "#1e293b",
+  strokeColor: "#1e40af",
   backgroundColor: "#dbeafe",
   fillStyle: "solid",
   strokeWidth: 2,
@@ -469,7 +713,7 @@ const makeEllipse = (
   width: w,
   height: h,
   strokeColor: "#334155",
-  backgroundColor: "#f0fdf4",
+  backgroundColor: "#ffffff",
   fillStyle: "solid",
   strokeWidth: 1.5,
   strokeStyle: "solid",
@@ -493,8 +737,8 @@ const makeDiamond = (
   y,
   width: w,
   height: h,
-  strokeColor: "#78350f",
-  backgroundColor: "#fef9c3",
+  strokeColor: "#92400e",
+  backgroundColor: "#fef3c7",
   fillStyle: "solid",
   strokeWidth: 1.5,
   strokeStyle: "solid",
@@ -512,7 +756,7 @@ const makeText = (
   bold = false,
   extra: Record<string, unknown> = {},
 ): ExElement => {
-  const w = text.length * fontSize * 0.6 + 16,
+  const w = text.length * fontSize * 0.62 + 16,
     h = fontSize * 1.4;
   return {
     ...BASE,
@@ -522,7 +766,7 @@ const makeText = (
     y: y - h / 2,
     width: w,
     height: h,
-    strokeColor: "#0f172a",
+    strokeColor: "#1e293b",
     backgroundColor: "transparent",
     fillStyle: "solid",
     strokeWidth: 1,
@@ -545,7 +789,6 @@ const makeText = (
   };
 };
 
-// Simple 2-point line (used for entity→attribute spokes)
 const makeLine = (
   x1: number,
   y1: number,
@@ -580,197 +823,55 @@ const makeLine = (
   ...extra,
 });
 
-// Multi-segment polyline — takes ABSOLUTE points, converts to relative
-const makePolyline = (
-  absPoints: Point[],
-  extra: Record<string, unknown> = {},
-): ExElement => {
-  const origin = absPoints[0]!;
-  const rel = absPoints.map((p) => [
-    +(p.x - origin.x).toFixed(2),
-    +(p.y - origin.y).toFixed(2),
-  ]);
-  const xs = absPoints.map((p) => p.x),
-    ys = absPoints.map((p) => p.y);
-  return {
-    ...BASE,
-    id: eid(),
-    type: "line",
-    x: origin.x,
-    y: origin.y,
-    width: Math.max(...xs) - Math.min(...xs),
-    height: Math.max(...ys) - Math.min(...ys),
-    strokeColor: "#64748b",
-    backgroundColor: "transparent",
-    fillStyle: "solid",
-    strokeWidth: 1.5,
-    strokeStyle: "solid",
-    roughness: 0,
-    roundness: { type: 2 },
-    seed: Math.floor(Math.random() * 999999),
-    points: rel,
-    lastCommittedPoint: null,
-    startBinding: null,
-    endBinding: null,
-    startArrowhead: null,
-    endArrowhead: null,
-    ...extra,
-  };
-};
-
-// ── Obstacle-aware orthogonal router ─────────────────────────────────────────
-
-type Rect = { x: number; y: number; w: number; h: number };
-
-function segHitsRect(
-  ax: number,
-  ay: number,
-  bx: number,
-  by: number,
-  r: Rect,
-): boolean {
-  const minX = Math.min(ax, bx),
-    maxX = Math.max(ax, bx);
-  const minY = Math.min(ay, by),
-    maxY = Math.max(ay, by);
-  if (maxX < r.x || minX > r.x + r.w || maxY < r.y || minY > r.y + r.h)
-    return false;
-  if (Math.abs(ax - bx) < 0.5)
-    return ax >= r.x && ax <= r.x + r.w && maxY >= r.y && minY <= r.y + r.h;
-  if (Math.abs(ay - by) < 0.5)
-    return ay >= r.y && ay <= r.y + r.h && maxX >= r.x && minX <= r.x + r.w;
-  return true;
+function diamondEdgePt(
+  mx: number,
+  my: number,
+  DW: number,
+  DH: number,
+  tx: number,
+  ty: number,
+): Point {
+  const ddx = tx - mx,
+    ddy = ty - my;
+  const hw = DW / 2,
+    hh = DH / 2;
+  if (Math.abs(ddx) * hh > Math.abs(ddy) * hw) {
+    const t = hw / Math.abs(ddx);
+    return { x: mx + ddx * t, y: my + ddy * t };
+  }
+  const t = hh / Math.max(Math.abs(ddy), 0.001);
+  return { x: mx + ddx * t, y: my + ddy * t };
 }
 
-function countHits(pts: Point[], obs: Rect[]): number {
-  let hits = 0;
-  for (let i = 0; i < pts.length - 1; i++) {
-    const a = pts[i]!,
-      b = pts[i + 1]!;
-    for (const r of obs)
-      if (segHitsRect(a.x, a.y, b.x, b.y, r)) {
-        hits++;
-        break;
-      }
-  }
-  return hits;
-}
-
-function pathLen(pts: Point[]): number {
-  let len = 0;
-  for (let i = 0; i < pts.length - 1; i++)
-    len += Math.hypot(pts[i + 1]!.x - pts[i]!.x, pts[i + 1]!.y - pts[i]!.y);
-  return len;
-}
-
-function simplify(pts: Point[]): Point[] {
-  if (pts.length <= 2) return pts;
-  const out: Point[] = [pts[0]!];
-  for (let i = 1; i < pts.length - 1; i++) {
-    const p = out[out.length - 1]!,
-      c = pts[i]!,
-      n = pts[i + 1]!;
-    const collinear =
-      (Math.abs(p.x - c.x) < 0.5 && Math.abs(c.x - n.x) < 0.5) ||
-      (Math.abs(p.y - c.y) < 0.5 && Math.abs(c.y - n.y) < 0.5);
-    if (!collinear) out.push(c);
-  }
-  out.push(pts[pts.length - 1]!);
-  return out;
-}
-
-function routeAvoiding(start: Point, end: Point, obs: Rect[]): Point[] {
-  const CLEAR = 24;
-  const inflated = obs.map((r) => ({
-    x: r.x - CLEAR,
-    y: r.y - CLEAR,
-    w: r.w + CLEAR * 2,
-    h: r.h + CLEAR * 2,
-  }));
-
-  if (countHits([start, end], inflated) === 0) return [start, end];
-
-  const xCoords = new Set<number>([start.x, end.x, (start.x + end.x) / 2]);
-  const yCoords = new Set<number>([start.y, end.y, (start.y + end.y) / 2]);
-  for (const r of inflated) {
-    xCoords.add(r.x - CLEAR);
-    xCoords.add(r.x + r.w + CLEAR);
-    yCoords.add(r.y - CLEAR);
-    yCoords.add(r.y + r.h + CLEAR);
-  }
-
-  const candidates: Point[][] = [];
-  for (const x of xCoords)
-    candidates.push([start, { x, y: start.y }, { x, y: end.y }, end]);
-  for (const y of yCoords)
-    candidates.push([start, { x: start.x, y }, { x: end.x, y }, end]);
-  for (const x of xCoords) {
-    for (const y of yCoords) {
-      candidates.push([
-        start,
-        { x, y: start.y },
-        { x, y },
-        { x: end.x, y },
-        end,
-      ]);
-      candidates.push([
-        start,
-        { x: start.x, y },
-        { x, y },
-        { x, y: end.y },
-        end,
-      ]);
-    }
-  }
-
-  let best: Point[] = [start, end];
-  let bestHits = Infinity,
-    bestLen = Infinity;
-  for (const c of candidates) {
-    const s = simplify(c);
-    const h = countHits(s, inflated);
-    const l = pathLen(s);
-    if (h < bestHits || (h === bestHits && l < bestLen)) {
-      best = s;
-      bestHits = h;
-      bestLen = l;
-    }
-  }
-  return simplify(best);
+// Label floated perpendicularly beside the midpoint of a segment
+function sideLabel(p1: Point, p2: Point, text: string): ExElement {
+  const mx = (p1.x + p2.x) / 2;
+  const my = (p1.y + p2.y) / 2;
+  const dx = p2.x - p1.x,
+    dy = p2.y - p1.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const px = -dy / len,
+    py = dx / len;
+  const offset = 18;
+  return makeText(mx + px * offset, my + py * offset, text, 12, true, {
+    strokeColor: "#374151",
+  });
 }
 
 function buildElements(layout: DiagramLayout): ExElement[] {
   const el: ExElement[] = [];
+  const diamonds: Map<string, Point> =
+    (layout.entities as any).__diamonds ?? new Map();
 
-  const allAttrObs: Rect[] = layout.entities.flatMap((ent) =>
-    ent.attributes.map((a) => ({
-      x: a.x - a.rx,
-      y: a.y - a.ry,
-      w: a.rx * 2,
-      h: a.ry * 2,
-    })),
-  );
-  const allEntityObs: Rect[] = layout.entities.map((ent) => ({
-    x: ent.x,
-    y: ent.y,
-    w: ent.width,
-    h: ent.height,
-  }));
-
-  // ── Entities + attributes ──────────────────────────────────────────
+  // Entities + attributes
   for (const ent of layout.entities) {
-    el.push(
-      makeRect(ent.x, ent.y, ent.width, ent.height, {
-        strokeColor: "#1e40af",
-        backgroundColor: "#bfdbfe",
-        strokeWidth: 2,
-      }),
-    );
+    el.push(makeRect(ent.x, ent.y, ent.width, ent.height));
     el.push(
       makeText(ent.cx, ent.cy, ent.name, 16, true, { strokeColor: "#1e3a8a" }),
     );
 
     for (const attr of ent.attributes) {
+      // Spoke line
       el.push(
         makeLine(
           attr.lineStart.x,
@@ -779,6 +880,7 @@ function buildElements(layout: DiagramLayout): ExElement[] {
           attr.lineEnd.y,
           {
             strokeColor: "#94a3b8",
+            strokeWidth: 1.5,
           },
         ),
       );
@@ -789,9 +891,9 @@ function buildElements(layout: DiagramLayout): ExElement[] {
           ? "#dcfce7"
           : "#ffffff";
       const sc = attr.isPrimary
-        ? "#92400e"
+        ? "#b45309"
         : attr.isForeign
-          ? "#14532d"
+          ? "#15803d"
           : "#475569";
 
       el.push(
@@ -808,6 +910,7 @@ function buildElements(layout: DiagramLayout): ExElement[] {
         ),
       );
 
+      // Double-border for PK
       if (attr.isPrimary) {
         const ins = 4;
         el.push(
@@ -818,7 +921,7 @@ function buildElements(layout: DiagramLayout): ExElement[] {
             (attr.ry - ins) * 2,
             {
               backgroundColor: "transparent",
-              strokeColor: "#92400e",
+              strokeColor: "#b45309",
               strokeWidth: 1,
             },
           ),
@@ -828,16 +931,19 @@ function buildElements(layout: DiagramLayout): ExElement[] {
       el.push(
         makeText(attr.x, attr.y, attr.label, 12, attr.isPrimary, {
           strokeColor: attr.isPrimary
-            ? "#78350f"
+            ? "#92400e"
             : attr.isForeign
               ? "#14532d"
-              : "#334155",
+              : "#374151",
         }),
       );
     }
   }
 
-  // ── Relationships ──────────────────────────────────────────────────
+  // Relationships
+  const DW = 116,
+    DH = 52;
+
   for (const ent of layout.entities) {
     for (const attr of ent.attributes) {
       if (!attr.isForeign || !attr.references) continue;
@@ -848,71 +954,45 @@ function buildElements(layout: DiagramLayout): ExElement[] {
       );
       if (!tgt) continue;
 
-      const mx = (ent.cx + tgt.cx) / 2;
-      const my = (ent.cy + tgt.cy) / 2;
-      const DW = 110,
-        DH = 54;
-
-      el.push(makeDiamond(mx - DW / 2, my - DH / 2, DW, DH));
-      el.push(makeText(mx, my, "has", 12, false, { strokeColor: "#78350f" }));
-
-      const dEdge = (tx: number, ty: number): Point => {
-        const ddx = tx - mx,
-          ddy = ty - my;
-        const hw = DW / 2,
-          hh = DH / 2;
-        if (Math.abs(ddx) * hh > Math.abs(ddy) * hw) {
-          const t = hw / Math.abs(ddx);
-          return { x: mx + ddx * t, y: my + ddy * t };
-        }
-        const t = hh / Math.max(Math.abs(ddy), 0.001);
-        return { x: mx + ddx * t, y: my + ddy * t };
+      const key = `${ent.id}:${tgt.id}`;
+      const dpos = diamonds.get(key) ?? {
+        x: (ent.cx + tgt.cx) / 2,
+        y: (ent.cy + tgt.cy) / 2,
       };
+      const dmx = dpos.x,
+        dmy = dpos.y;
 
-      const routeObs = [
-        ...allAttrObs,
-        ...allEntityObs.filter(
-          (r) =>
-            !(r.x === ent.x && r.y === ent.y) &&
-            !(r.x === tgt.x && r.y === tgt.y),
-        ),
-      ];
+      // Diamond shape
+      el.push(makeDiamond(dmx - DW / 2, dmy - DH / 2, DW, DH));
+      el.push(makeText(dmx, dmy, "has", 12, true, { strokeColor: "#92400e" }));
 
       // Source → diamond
-      const src = rectEdgePoint(ent, { x: mx, y: my });
-      const dEntry = dEdge(src.x, src.y);
-      const srcPath = routeAvoiding(src, dEntry, routeObs);
-      el.push(makePolyline(srcPath, { strokeColor: "#64748b" }));
-      const srcMid = srcPath[Math.floor(srcPath.length / 2)]!;
+      const srcPt = rectEdgePoint(ent, { x: dmx, y: dmy });
+      const dEntry = diamondEdgePt(dmx, dmy, DW, DH, srcPt.x, srcPt.y);
       el.push(
-        makeText(srcMid.x + 10, srcMid.y - 14, "1", 12, true, {
+        makeLine(srcPt.x, srcPt.y, dEntry.x, dEntry.y, {
           strokeColor: "#475569",
+          strokeWidth: 1.5,
         }),
       );
+      el.push(sideLabel(srcPt, dEntry, "1"));
 
       // Diamond → target
-      const tgtPt = rectEdgePoint(tgt, { x: mx, y: my });
-      const dExit = dEdge(tgtPt.x, tgtPt.y);
-      const tgtPath = routeAvoiding(dExit, tgtPt, routeObs);
+      const tgtPt = rectEdgePoint(tgt, { x: dmx, y: dmy });
+      const dExit = diamondEdgePt(dmx, dmy, DW, DH, tgtPt.x, tgtPt.y);
       el.push(
-        makePolyline(tgtPath, {
-          strokeColor: "#64748b",
+        makeLine(dExit.x, dExit.y, tgtPt.x, tgtPt.y, {
+          strokeColor: "#475569",
+          strokeWidth: 1.5,
           endArrowhead: "arrow",
         }),
       );
-      const tgtMid = tgtPath[Math.floor(tgtPath.length / 2)]!;
-      el.push(
-        makeText(tgtMid.x + 10, tgtMid.y - 14, "N", 12, true, {
-          strokeColor: "#475569",
-        }),
-      );
+      el.push(sideLabel(dExit, tgtPt, "N"));
     }
   }
 
   return el;
 }
-
-// ─── Sample SQL ───────────────────────────────────────────────────────────────
 
 const SAMPLE_SQL = `CREATE TABLE users (
   id INT PRIMARY KEY,
@@ -938,7 +1018,7 @@ CREATE TABLE order_items (
   CONSTRAINT fk_order FOREIGN KEY (order_id) REFERENCES orders(id)
 );`;
 
-// ─── Excalidraw ───────────────────────────────────────────────────────────────
+// - Excalidraw -
 
 const Excalidraw = dynamic(
   () => import("@excalidraw/excalidraw").then((m) => m.Excalidraw),
@@ -960,7 +1040,7 @@ const LEGEND = [
   { color: "bg-yellow-100 border-yellow-500", label: "Relationship" },
 ];
 
-// ─── Page ─────────────────────────────────────────────────────────────────────
+// - Page -
 
 export default function ERDiagramPage() {
   const [sql, setSql] = useState(SAMPLE_SQL);
@@ -1086,7 +1166,7 @@ export default function ERDiagramPage() {
 
   return (
     <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-gray-50 font-sans text-gray-900">
-      {/* ── Top bar ─────────────────────────────────────────────────────── */}
+      {/* - Top bar - */}
       <header className="relative z-30 flex h-13 shrink-0 items-center justify-between border-b border-gray-200 bg-white px-4 shadow-sm">
         {/* Brand */}
         <div className="flex items-center gap-3">
@@ -1192,7 +1272,7 @@ export default function ERDiagramPage() {
         </div>
       </header>
 
-      {/* ── Body ─────────────────────────────────────────────────────────── */}
+      {/* - Body - */}
       <div className="relative flex-1 overflow-hidden">
         {/* Canvas — positioned absolutely so closing the panel truly gives it 100% width */}
         <div
@@ -1314,7 +1394,7 @@ export default function ERDiagramPage() {
         </aside>
       </div>
 
-      {/* ── Error Toast ──────────────────────────────────────────────────── */}
+      {/* - Error Toast - */}
       {error && (
         <div className="absolute bottom-6 left-1/2 z-50 -translate-x-1/2 whitespace-nowrap rounded-xl border border-red-200 bg-white px-5 py-3 text-xs font-medium text-red-600 shadow-xl">
           <span className="mr-1.5">⚠</span>
